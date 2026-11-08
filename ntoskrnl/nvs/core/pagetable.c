@@ -440,11 +440,14 @@ MiPtWrite(
     _In_ ULONG TableFrame,
     _In_ MI_PTE Value)
 {
-    PMI_PFN Table = &Space->System->Pfn.Pfn[TableFrame];
+    PMI_PFN Table;
     MI_PTE Old = MiArchPteRead(Slot);
 
     MiArchPteWrite(Slot, Value);
 
+    if (!MiPfnTracked(&Space->System->Pfn, TableFrame))
+        return;
+    Table = &Space->System->Pfn.Pfn[TableFrame];
     if (MI_PFN_FLAGS(Table) & MI_PFN_FLAG_PINNED)
         return;
 
