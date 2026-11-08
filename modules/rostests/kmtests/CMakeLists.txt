@@ -530,6 +530,7 @@ list(APPEND KMTEST_SOURCE
     ntos_cc/CcPinRead_user.c
     ntos_cc/CcSetFileSizes_user.c
     ntos_io/IoAddDeviceUnload_user.c
+    ntos_io/IoRemoveChild_user.c
     ntos_io/IoCreateFile_user.c
     ntos_io/IoDeviceObject_user.c
     ntos_io/IoReadWrite_user.c
@@ -564,6 +565,8 @@ configure_file(ntos_po/kmtest_pofx.inf kmtest_pofx.inf COPYONLY)
 add_rostests_file(FILE "${CMAKE_CURRENT_BINARY_DIR}/kmtest_pofx.inf")
 configure_file(ntos_io/kmtest_addfail.inf kmtest_addfail.inf COPYONLY)
 add_rostests_file(FILE "${CMAKE_CURRENT_BINARY_DIR}/kmtest_addfail.inf")
+configure_file(ntos_io/kmtest_remchild.inf kmtest_remchild.inf COPYONLY)
+add_rostests_file(FILE "${CMAKE_CURRENT_BINARY_DIR}/kmtest_remchild.inf")
 
 #
 # Group targets
@@ -583,6 +586,7 @@ add_dependencies(kmtest_drivers
     iodeviceobject_drv
     iohelper_drv
     ioreadwrite_drv
+    ioremovechild_drv
     kernel32_drv
     mmmaplockedpagesspecifycache_drv
     ntcreatesection_drv

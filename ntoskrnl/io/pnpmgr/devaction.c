@@ -2453,6 +2453,41 @@ IopSendRemoveDeviceRelations(PDEVICE_RELATIONS DeviceRelations)
 }
 
 static
+BOOLEAN
+PiChildRemovalStarted(
+    _In_ PDEVICE_NODE DeviceNode,
+    _In_ BOOLEAN Force)
+{
+    return DeviceNode->State == DeviceNodeRemoved ||
+           (Force && DeviceNode->State == DeviceNodeRemovePendingCloses);
+}
+
+static
+VOID
+PiDetachRemovedChildren(
+    _In_ PDEVICE_NODE ParentDeviceNode)
+{
+    PDEVICE_NODE ChildDeviceNode, NextDeviceNode;
+    KIRQL OldIrql;
+
+    KeAcquireSpinLock(&IopDeviceTreeLock, &OldIrql);
+    ChildDeviceNode = ParentDeviceNode->Child;
+    while (ChildDeviceNode != NULL)
+    {
+        NextDeviceNode = ChildDeviceNode->Sibling;
+        KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);
+
+        if (ChildDeviceNode->State == DeviceNodeRemoved)
+            PiUnlinkDevNode(ChildDeviceNode);
+
+        ChildDeviceNode = NextDeviceNode;
+
+        KeAcquireSpinLock(&IopDeviceTreeLock, &OldIrql);
+    }
+    KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);
+}
+
+static
 VOID
 IopSendRemoveChildDevices(PDEVICE_NODE ParentDeviceNode)
 {
@@ -2468,7 +2503,8 @@ IopSendRemoveChildDevices(PDEVICE_NODE ParentDeviceNode)
 
         /* The PDO may outlive its removed parent while references drain. */
         PiUnlinkDevNode(ChildDeviceNode);
-        IopSendRemoveDevice(ChildDeviceNode->PhysicalDeviceObject);
+        if (ChildDeviceNode->State != DeviceNodeRemoved)
+            IopSendRemoveDevice(ChildDeviceNode->PhysicalDeviceObject);
 
         ChildDeviceNode = NextDeviceNode;
 
@@ -2589,13 +2625,16 @@ IopQueryRemoveChildDevices(PDEVICE_NODE ParentDeviceNode, BOOLEAN Force)
     {
         NextDeviceNode = ChildDeviceNode->Sibling;
         KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);
-        PiSetDevNodeState(ChildDeviceNode, DeviceNodeAwaitingQueuedRemoval);
-
-        Status = IopPrepareDeviceForRemoval(ChildDeviceNode->PhysicalDeviceObject, Force);
-        if (!NT_SUCCESS(Status))
+        if (!PiChildRemovalStarted(ChildDeviceNode, Force))
         {
-            FailedRemoveDevice = ChildDeviceNode;
-            goto cleanup;
+            PiSetDevNodeState(ChildDeviceNode, DeviceNodeAwaitingQueuedRemoval);
+
+            Status = IopPrepareDeviceForRemoval(ChildDeviceNode->PhysicalDeviceObject, Force);
+            if (!NT_SUCCESS(Status))
+            {
+                FailedRemoveDevice = ChildDeviceNode;
+                goto cleanup;
+            }
         }
 
         KeAcquireSpinLock(&IopDeviceTreeLock, &OldIrql);
@@ -2613,7 +2652,8 @@ cleanup:
         NextDeviceNode = ChildDeviceNode->Sibling;
         KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);
 
-        IopCancelPrepareDeviceForRemoval(ChildDeviceNode->PhysicalDeviceObject);
+        if (!PiChildRemovalStarted(ChildDeviceNode, Force))
+            IopCancelPrepareDeviceForRemoval(ChildDeviceNode->PhysicalDeviceObject);
 
         /* IRP_MN_CANCEL_REMOVE_DEVICE is also sent to the device
          * that failed the IRP_MN_QUERY_REMOVE_DEVICE request */
@@ -2752,16 +2792,23 @@ PiSurpriseRemoveChildDevices(PDEVICE_NODE ParentDeviceNode)
         NextDeviceNode = ChildDeviceNode->Sibling;
         KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);
 
-        IopSendSurpriseRemoval(ChildDeviceNode->PhysicalDeviceObject);
-        IopQueueTargetDeviceEvent(&GUID_DEVICE_SURPRISE_REMOVAL, &ChildDeviceNode->InstancePath);
-        PiNotifyTargetDeviceChange(&GUID_TARGET_DEVICE_REMOVE_COMPLETE, ChildDeviceNode->PhysicalDeviceObject, NULL);
-        IopDisableDeviceInterfaces(ChildDeviceNode);
-        if (ChildDeviceNode->CapabilityFlags & 0x00000008)
-            PiNotifyHardwareProfileChange(&GUID_HWPROFILE_CHANGE_COMPLETE);
-        InterlockedIncrement(&PiRemovePendingCloses);
-        PiSetDevNodeState(ChildDeviceNode, DeviceNodeRemovePendingCloses);
-        PiRetryDuplicateInstances();
-        PiQueueDeviceAction(ChildDeviceNode->PhysicalDeviceObject, PiActionCloseRemovedDevice, NULL, NULL);
+        if (ChildDeviceNode->State == DeviceNodeRemoved)
+        {
+            PiUnlinkDevNode(ChildDeviceNode);
+        }
+        else if (ChildDeviceNode->State != DeviceNodeRemovePendingCloses)
+        {
+            IopSendSurpriseRemoval(ChildDeviceNode->PhysicalDeviceObject);
+            IopQueueTargetDeviceEvent(&GUID_DEVICE_SURPRISE_REMOVAL, &ChildDeviceNode->InstancePath);
+            PiNotifyTargetDeviceChange(&GUID_TARGET_DEVICE_REMOVE_COMPLETE, ChildDeviceNode->PhysicalDeviceObject, NULL);
+            IopDisableDeviceInterfaces(ChildDeviceNode);
+            if (ChildDeviceNode->CapabilityFlags & 0x00000008)
+                PiNotifyHardwareProfileChange(&GUID_HWPROFILE_CHANGE_COMPLETE);
+            InterlockedIncrement(&PiRemovePendingCloses);
+            PiSetDevNodeState(ChildDeviceNode, DeviceNodeRemovePendingCloses);
+            PiRetryDuplicateInstances();
+            PiQueueDeviceAction(ChildDeviceNode->PhysicalDeviceObject, PiActionCloseRemovedDevice, NULL, NULL);
+        }
 
         ChildDeviceNode = NextDeviceNode;
 
@@ -3004,6 +3051,8 @@ PipQueryAndRemoveDevice(
         KeAcquireSpinLock(&IopDeviceTreeLock, &OldIrql);
         for (Child = Node->Child; Child; Child = Child->Sibling)
         {
+            if (Child->State == DeviceNodeRemoved)
+                continue;
             Status = PipAddRemovalDevice(&Devices, Child->PhysicalDeviceObject);
             if (!NT_SUCCESS(Status))
                 break;
@@ -3089,6 +3138,7 @@ PipQueryAndRemoveDevice(
         PiSetDevNodeState(Node, DeviceNodeAwaitingQueuedRemoval);
         if (Node->Parent && PipRemovalListContains(&Devices, Node->Parent->PhysicalDeviceObject))
             PiUnlinkDevNode(Node);
+        PiDetachRemovedChildren(Node);
         IopSendRemoveDevice(Entry->DeviceObject);
     }
     Status = STATUS_SUCCESS;
