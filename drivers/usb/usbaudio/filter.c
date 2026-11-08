@@ -2443,6 +2443,102 @@ UsbAudioReadSampleFrequency(
            ((ULONG)Frequency[2] << 16);
 }
 
+PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR
+UsbAudioFindPcmStreamingGeneral(
+    IN PUSB_CONFIGURATION_DESCRIPTOR ConfigurationDescriptor,
+    IN PUSB_INTERFACE_DESCRIPTOR InterfaceDescriptor)
+{
+    PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR General;
+    PUSB_COMMON_DESCRIPTOR CommonDescriptor;
+    PUCHAR DescriptorEnd;
+
+    if (InterfaceDescriptor->bInterfaceProtocol != 0)
+        return NULL;
+
+    DescriptorEnd = (PUCHAR)ConfigurationDescriptor + ConfigurationDescriptor->wTotalLength;
+    CommonDescriptor = (PUSB_COMMON_DESCRIPTOR)((PUCHAR)InterfaceDescriptor + InterfaceDescriptor->bLength);
+    while ((PUCHAR)CommonDescriptor + sizeof(USB_COMMON_DESCRIPTOR) <= DescriptorEnd &&
+           CommonDescriptor->bLength != 0 &&
+           (PUCHAR)CommonDescriptor + CommonDescriptor->bLength <= DescriptorEnd &&
+           CommonDescriptor->bDescriptorType != USB_INTERFACE_DESCRIPTOR_TYPE)
+    {
+        General = (PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR)CommonDescriptor;
+        if (CommonDescriptor->bDescriptorType == USB_AUDIO_CONTROL_TERMINAL_DESCRIPTOR_TYPE &&
+            CommonDescriptor->bLength >= sizeof(USB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR) &&
+            General->bDescriptorSubtype == 0x01)
+        {
+            if (General->wFormatTag == WAVE_FORMAT_PCM || General->wFormatTag == 0 || General->wFormatTag >= 64)
+                return General;
+            DPRINT1("usbaudio: interface %u alternate setting %u uses format tag %x\n",
+                    InterfaceDescriptor->bInterfaceNumber, InterfaceDescriptor->bAlternateSetting,
+                    General->wFormatTag);
+            return NULL;
+        }
+        CommonDescriptor = (PUSB_COMMON_DESCRIPTOR)((PUCHAR)CommonDescriptor + CommonDescriptor->bLength);
+    }
+    return NULL;
+}
+
+static
+PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR
+UsbAudioGetPcmFormatForTerminal(
+    IN PUSB_CONFIGURATION_DESCRIPTOR ConfigurationDescriptor,
+    IN PUSB_INTERFACE_DESCRIPTOR InterfaceDescriptor,
+    IN UCHAR bTerminalID,
+    OUT PULONG RangeCount)
+{
+    PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR General;
+    PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR Format;
+
+    if (InterfaceDescriptor->bInterfaceSubClass != 0x02 || InterfaceDescriptor->bNumEndpoints == 0)
+        return NULL;
+    General = UsbAudioFindPcmStreamingGeneral(ConfigurationDescriptor, InterfaceDescriptor);
+    if (!General || General->bTerminalLink != bTerminalID)
+        return NULL;
+    Format = UsbAudioFindFormatTypeDescriptor(ConfigurationDescriptor, InterfaceDescriptor);
+    if (!Format || Format->bSubframeSize == 0 || Format->bNrChannels == 0)
+        return NULL;
+    if (Format->bSamFreqType == 0)
+    {
+        if (Format->bLength < FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) + 6)
+            return NULL;
+        *RangeCount = 1;
+    }
+    else
+    {
+        if (Format->bLength < FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) +
+                              Format->bSamFreqType * 3)
+            return NULL;
+        *RangeCount = Format->bSamFreqType;
+    }
+    return Format;
+}
+
+static
+PKSDATARANGE_AUDIO
+UsbAudioAllocatePcmDataRange(
+    IN PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR Format,
+    IN ULONG MinimumFrequency,
+    IN ULONG MaximumFrequency)
+{
+    PKSDATARANGE_AUDIO DataRangeAudio;
+
+    DataRangeAudio = AllocFunction(sizeof(KSDATARANGE_AUDIO));
+    if (DataRangeAudio == NULL)
+        return NULL;
+    DataRangeAudio->DataRange.FormatSize = sizeof(KSDATARANGE_AUDIO);
+    DataRangeAudio->DataRange.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
+    DataRangeAudio->DataRange.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+    DataRangeAudio->DataRange.Specifier = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+    DataRangeAudio->DataRange.SampleSize = Format->bSubframeSize * Format->bNrChannels;
+    DataRangeAudio->MaximumChannels = Format->bNrChannels;
+    DataRangeAudio->MinimumBitsPerSample = Format->bBitResolution;
+    DataRangeAudio->MaximumBitsPerSample = Format->bBitResolution;
+    DataRangeAudio->MinimumSampleFrequency = MinimumFrequency;
+    DataRangeAudio->MaximumSampleFrequency = MaximumFrequency;
+    return DataRangeAudio;
+}
+
 VOID
 UsbAudioGetDataRanges(
     IN PUSB_CONFIGURATION_DESCRIPTOR ConfigurationDescriptor,
@@ -2450,7 +2546,6 @@ UsbAudioGetDataRanges(
     OUT PKSDATARANGE** OutDataRanges,
     OUT PULONG OutDataRangesCount)
 {
-    PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR StreamingInterfaceDescriptor;
     PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR StreamingFormatDescriptor;
     PUSB_INTERFACE_DESCRIPTOR Descriptor;
     PKSDATARANGE_AUDIO DataRangeAudio;
@@ -2460,50 +2555,13 @@ UsbAudioGetDataRanges(
     *OutDataRanges = NULL;
     *OutDataRangesCount = 0;
 
-    /* count all data ranges */
     DataRangeCount = 0;
     for (Descriptor = USBD_ParseConfigurationDescriptorEx(ConfigurationDescriptor, ConfigurationDescriptor, -1, -1, USB_DEVICE_CLASS_AUDIO, -1, -1);
     Descriptor != NULL;
         Descriptor = USBD_ParseConfigurationDescriptorEx(ConfigurationDescriptor, (PVOID)((ULONG_PTR)Descriptor + Descriptor->bLength), -1, -1, USB_DEVICE_CLASS_AUDIO, -1, -1))
     {
-        if (Descriptor->bInterfaceSubClass == 0x02 && /* AUDIO_STREAMING */
-            Descriptor->bNumEndpoints > 0)
-        {
-            StreamingInterfaceDescriptor = (PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR)USBD_ParseDescriptors(ConfigurationDescriptor, ConfigurationDescriptor->wTotalLength, Descriptor, USB_AUDIO_CONTROL_TERMINAL_DESCRIPTOR_TYPE);
-            if (StreamingInterfaceDescriptor != NULL)
-            {
-                ASSERT(StreamingInterfaceDescriptor->bDescriptorSubtype == 0x01);
-                ASSERT(StreamingInterfaceDescriptor->wFormatTag == WAVE_FORMAT_PCM);
-                if (StreamingInterfaceDescriptor->bTerminalLink == bTerminalID)
-                {
-                    StreamingFormatDescriptor = (PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR)((ULONG_PTR)StreamingInterfaceDescriptor + StreamingInterfaceDescriptor->bLength);
-                    if (StreamingFormatDescriptor->bDescriptorType != USB_AUDIO_CONTROL_TERMINAL_DESCRIPTOR_TYPE ||
-                        StreamingFormatDescriptor->bDescriptorSubtype != 0x02 ||
-                        StreamingFormatDescriptor->bFormatType != 0x01 ||
-                        StreamingFormatDescriptor->bSubframeSize == 0 ||
-                        StreamingFormatDescriptor->bNrChannels == 0)
-                    {
-                        continue;
-                    }
-
-                    NumFrequency = StreamingFormatDescriptor->bSamFreqType;
-                    if (NumFrequency == 0)
-                    {
-                        if (StreamingFormatDescriptor->bLength >=
-                            FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) + 6)
-                        {
-                            DataRangeCount++;
-                        }
-                    }
-                    else if (StreamingFormatDescriptor->bLength >=
-                             FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) +
-                             (NumFrequency * 3))
-                    {
-                        DataRangeCount += NumFrequency;
-                    }
-                }
-            }
-        }
+        if (UsbAudioGetPcmFormatForTerminal(ConfigurationDescriptor, Descriptor, bTerminalID, &NumFrequency))
+            DataRangeCount += NumFrequency;
     }
 
     if (DataRangeCount == 0)
@@ -2518,94 +2576,33 @@ UsbAudioGetDataRanges(
 
     DataRangeIndex = 0;
     for (Descriptor = USBD_ParseConfigurationDescriptorEx(ConfigurationDescriptor, ConfigurationDescriptor, -1, -1, USB_DEVICE_CLASS_AUDIO, -1, -1);
-    Descriptor != NULL;
+    Descriptor != NULL && DataRangeIndex < DataRangeCount;
         Descriptor = USBD_ParseConfigurationDescriptorEx(ConfigurationDescriptor, (PVOID)((ULONG_PTR)Descriptor + Descriptor->bLength), -1, -1, USB_DEVICE_CLASS_AUDIO, -1, -1))
     {
-        if (Descriptor->bInterfaceSubClass == 0x02 && /* AUDIO_STREAMING */
-            Descriptor->bNumEndpoints > 0)
+        StreamingFormatDescriptor = UsbAudioGetPcmFormatForTerminal(ConfigurationDescriptor, Descriptor, bTerminalID,
+                                                                    &NumFrequency);
+        if (!StreamingFormatDescriptor)
+            continue;
+
+        if (StreamingFormatDescriptor->bSamFreqType == 0)
         {
-            StreamingInterfaceDescriptor = (PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR)USBD_ParseDescriptors(ConfigurationDescriptor, ConfigurationDescriptor->wTotalLength, Descriptor, USB_AUDIO_CONTROL_TERMINAL_DESCRIPTOR_TYPE);
-            if (StreamingInterfaceDescriptor != NULL)
-            {
-                ASSERT(StreamingInterfaceDescriptor->bDescriptorSubtype == 0x01);
-                ASSERT(StreamingInterfaceDescriptor->wFormatTag == WAVE_FORMAT_PCM);
-                if (StreamingInterfaceDescriptor->bTerminalLink == bTerminalID)
-                {
-                    StreamingFormatDescriptor = (PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR)((ULONG_PTR)StreamingInterfaceDescriptor + StreamingInterfaceDescriptor->bLength);
-                    ASSERT(StreamingFormatDescriptor->bDescriptorType == 0x24);
-                    ASSERT(StreamingFormatDescriptor->bDescriptorSubtype == 0x02);
-                    ASSERT(StreamingFormatDescriptor->bFormatType == 0x01);
+            DataRangeAudio = UsbAudioAllocatePcmDataRange(StreamingFormatDescriptor,
+                                                          UsbAudioReadSampleFrequency(&StreamingFormatDescriptor->tSamFreq[0]),
+                                                          UsbAudioReadSampleFrequency(StreamingFormatDescriptor->tSamFreq + 3));
+            if (DataRangeAudio == NULL)
+                goto Cleanup;
+            DataRangeAudioArray[DataRangeIndex++] = (PKSDATARANGE)DataRangeAudio;
+            continue;
+        }
 
-                    NumFrequency = StreamingFormatDescriptor->bSamFreqType;
-                    if (NumFrequency == 0)
-                    {
-                        if (StreamingFormatDescriptor->bLength <
-                            FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) + 6)
-                        {
-                            continue;
-                        }
+        for (Index = 0; Index < NumFrequency && DataRangeIndex < DataRangeCount; Index++)
+        {
+            ULONG SampleFrequency = UsbAudioReadSampleFrequency(&StreamingFormatDescriptor->tSamFreq[Index * 3]);
 
-                        DataRangeAudio = AllocFunction(sizeof(KSDATARANGE_AUDIO));
-                        if (DataRangeAudio == NULL)
-                            goto Cleanup;
-
-                        DataRangeAudio->DataRange.FormatSize = sizeof(KSDATARANGE_AUDIO);
-                        DataRangeAudio->DataRange.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-                        DataRangeAudio->DataRange.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
-                        DataRangeAudio->DataRange.Specifier = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-                        DataRangeAudio->DataRange.SampleSize =
-                            StreamingFormatDescriptor->bSubframeSize *
-                            StreamingFormatDescriptor->bNrChannels;
-                        DataRangeAudio->MaximumChannels = StreamingFormatDescriptor->bNrChannels;
-                        DataRangeAudio->MinimumBitsPerSample = StreamingFormatDescriptor->bBitResolution;
-                        DataRangeAudio->MaximumBitsPerSample = StreamingFormatDescriptor->bBitResolution;
-                        DataRangeAudio->MinimumSampleFrequency =
-                            UsbAudioReadSampleFrequency(&StreamingFormatDescriptor->tSamFreq[0]);
-                        DataRangeAudio->MaximumSampleFrequency =
-                            UsbAudioReadSampleFrequency(StreamingFormatDescriptor->tSamFreq + 3);
-
-                        DataRangeAudioArray[DataRangeIndex] = (PKSDATARANGE)DataRangeAudio;
-                        DataRangeIndex++;
-                    }
-                    else
-                    {
-                        for (Index = 0; Index < NumFrequency; Index++)
-                        {
-                            ULONG SampleFrequency;
-
-                            if (StreamingFormatDescriptor->bLength <
-                                FIELD_OFFSET(USB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR, tSamFreq) +
-                                ((Index + 1) * 3))
-                            {
-                                break;
-                            }
-
-                            SampleFrequency =
-                                UsbAudioReadSampleFrequency(&StreamingFormatDescriptor->tSamFreq[Index * 3]);
-
-                            DataRangeAudio = AllocFunction(sizeof(KSDATARANGE_AUDIO));
-                            if (DataRangeAudio == NULL)
-                                goto Cleanup;
-
-                            DataRangeAudio->DataRange.FormatSize = sizeof(KSDATARANGE_AUDIO);
-                            DataRangeAudio->DataRange.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-                            DataRangeAudio->DataRange.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
-                            DataRangeAudio->DataRange.Specifier = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-                            DataRangeAudio->DataRange.SampleSize =
-                                StreamingFormatDescriptor->bSubframeSize *
-                                StreamingFormatDescriptor->bNrChannels;
-                            DataRangeAudio->MaximumChannels = StreamingFormatDescriptor->bNrChannels;
-                            DataRangeAudio->MinimumBitsPerSample = StreamingFormatDescriptor->bBitResolution;
-                            DataRangeAudio->MaximumBitsPerSample = StreamingFormatDescriptor->bBitResolution;
-                            DataRangeAudio->MinimumSampleFrequency = SampleFrequency;
-                            DataRangeAudio->MaximumSampleFrequency = SampleFrequency;
-
-                            DataRangeAudioArray[DataRangeIndex] = (PKSDATARANGE)DataRangeAudio;
-                            DataRangeIndex++;
-                        }
-                    }
-                }
-            }
+            DataRangeAudio = UsbAudioAllocatePcmDataRange(StreamingFormatDescriptor, SampleFrequency, SampleFrequency);
+            if (DataRangeAudio == NULL)
+                goto Cleanup;
+            DataRangeAudioArray[DataRangeIndex++] = (PKSDATARANGE)DataRangeAudio;
         }
     }
 
@@ -2627,7 +2624,6 @@ Cleanup:
     if (DataRangeAudioArray)
         FreeFunction(DataRangeAudioArray);
 }
-
 
 NTSTATUS
 USBAudioPinBuildDescriptors(

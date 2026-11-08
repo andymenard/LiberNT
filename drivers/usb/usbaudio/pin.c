@@ -282,7 +282,6 @@ UsbAudioFindStreamingEndpointDescriptor(
     return NULL;
 }
 
-static
 PUSB_AUDIO_STREAMING_FORMAT_TYPE_DESCRIPTOR
 UsbAudioFindFormatTypeDescriptor(
     IN PUSB_CONFIGURATION_DESCRIPTOR ConfigurationDescriptor,
@@ -633,11 +632,9 @@ USBAudioSelectAudioStreamingInterface(
     {
         if (InterfaceDescriptor->bInterfaceSubClass == 0x02 /* AUDIO_STREAMING */ && InterfaceDescriptor->bNumEndpoints > 0)
         {
-            StreamingInterfaceDescriptor = (PUSB_AUDIO_STREAMING_INTERFACE_DESCRIPTOR)USBD_ParseDescriptors(ConfigurationDescriptor, ConfigurationDescriptor->wTotalLength, InterfaceDescriptor, USB_AUDIO_CONTROL_TERMINAL_DESCRIPTOR_TYPE);
+            StreamingInterfaceDescriptor = UsbAudioFindPcmStreamingGeneral(ConfigurationDescriptor, InterfaceDescriptor);
             if (StreamingInterfaceDescriptor != NULL)
             {
-                ASSERT(StreamingInterfaceDescriptor->bDescriptorSubtype == 0x01);
-                ASSERT(StreamingInterfaceDescriptor->wFormatTag == WAVE_FORMAT_PCM);
                 if (StreamingInterfaceDescriptor->bTerminalLink == TerminalDescriptor->bTerminalID)
                 {
                     FormatDescriptor = UsbAudioFindFormatTypeDescriptor(ConfigurationDescriptor,
