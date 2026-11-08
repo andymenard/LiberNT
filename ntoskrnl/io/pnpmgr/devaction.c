@@ -823,6 +823,9 @@ PiAttachFilterDriversCallback(
                 case STATUS_ILL_FORMED_SERVICE_ENTRY:
                     PiSetDevNodeProblem(context->DeviceNode, CM_PROB_DRIVER_SERVICE_KEY_INVALID);
                     break;
+                case STATUS_IMAGE_ALREADY_LOADED:
+                    PiSetDevNodeProblem(context->DeviceNode, CM_PROB_DRIVER_FAILED_PRIOR_UNLOAD);
+                    break;
                 default:
                     PiSetDevNodeProblem(context->DeviceNode, CM_PROB_DRIVER_FAILED_LOAD);
                     break;
