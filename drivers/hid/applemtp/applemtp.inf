@@ -17,6 +17,7 @@ DefaultDestDir = 12
 
 [StdMfg]
 %AppleMtp.DeviceDesc% = AppleMtp_Inst,FDT\apple_dockchannel
+%AppleMtp.DeviceDesc% = AppleMtp_Inst,FDT\apple_spi
 
 [AppleMtp_Inst.NT]
 CopyFiles = AppleMtp_CopyFiles
@@ -41,4 +42,4 @@ LoadOrderGroup = Extended Base
 LiberNT = "LiberNT Project"
 StdMfg = "(Standard system devices)"
 AppleMtp.DeviceDesc = "Apple Internal Keyboard and Trackpad"
-AppleMtp.ServiceDesc = "Apple MTP HID Transport Driver"
+AppleMtp.ServiceDesc = "Apple Internal Keyboard and Trackpad Driver"

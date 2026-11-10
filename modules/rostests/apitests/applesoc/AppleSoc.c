@@ -828,6 +828,8 @@ SimSpiWrite(ULONG Offset, ULONG Value)
 
 static ULONG SimPinLevelPin = MAXULONG;
 static BOOLEAN (*SimPinLevel)(VOID);
+static ULONG SimPinWatchPin = MAXULONG;
+static VOID (*SimPinWritten)(ULONG Value);
 
 static
 ULONG
@@ -1028,6 +1030,12 @@ SimWrite(volatile ULONG *Address, ULONG Value)
         SimSpiWrite(Offset, Value);
         return;
     }
+    if (Region == &SimRegions[9] && SimPinWritten && Offset == SimPinWatchPin * sizeof(ULONG))
+    {
+        Region->Data[Offset / sizeof(ULONG)] = Value;
+        SimPinWritten(Value);
+        return;
+    }
     if (Region == &SimRegions[SIM_MCA_INDEX] && ((Offset % 0x4000) == 0x300 || (Offset % 0x4000) == 0x400) &&
         (Value & 2) && !SimMcaStuck)
         Value &= ~2;
@@ -1102,6 +1110,13 @@ UatSleepMs(ULONG Milliseconds)
     SimSleptMs += Milliseconds;
 }
 
+static
+VOID
+SpiHidSleepMs(ULONG Milliseconds)
+{
+    SimSleptMs += Milliseconds;
+}
+
 #include "../../../../sdk/lib/drivers/fdtdrv/fdtdrv.c"
 #include "../../../../sdk/lib/drivers/applertkit/pmgr.c"
 #include "../../../../sdk/lib/drivers/applertkit/dart.c"
@@ -1115,6 +1130,7 @@ UatSleepMs(ULONG Milliseconds)
 #include "../../../../sdk/lib/drivers/applertkit/gpio.c"
 #include "../../../../sdk/lib/drivers/applertkit/i2c.c"
 #include "../../../../sdk/lib/drivers/applertkit/spi.c"
+#include "../../../../drivers/hid/applemtp/spihid.c"
 #include "../../../../sdk/lib/drivers/applertkit/nco.c"
 #include "../../../../sdk/lib/drivers/applertkit/admac.c"
 #include "../../../../sdk/lib/drivers/applertkit/mca.c"
@@ -4709,6 +4725,8 @@ ResetSpiSimulation(PFDT_DRIVER_TREE Tree, BOOLEAN Transport)
     SimSpiRunning = SimSpiStuck = SimSpiOverflow = SimSpiSelected = FALSE;
     SimPinLevel = NULL;
     SimPinLevelPin = MAXULONG;
+    SimPinWritten = NULL;
+    SimPinWatchPin = MAXULONG;
     BuildSpiTree(Transport);
     ok(Builder.StructureSize < sizeof(Builder.Structure) && Builder.StringsSize < sizeof(Builder.Strings),
        "The SPI tree overflowed the builder (%lu, %lu)\n", Builder.StructureSize, Builder.StringsSize);
@@ -4862,6 +4880,388 @@ TestGpioInterrupt(VOID)
            STATUS_DEVICE_CONFIGURATION_ERROR);
     ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "apple,spi"), &Gpio), STATUS_NOT_FOUND);
     ok_int(SimMapCount, 0);
+}
+
+static UCHAR SimHidQueue[16][256];
+static ULONG SimHidQueueHead, SimHidQueueCount;
+static UCHAR SimHidMosi[260];
+static ULONG SimHidMosiCount, SimHidMisoCount, SimHidStatusIndex;
+static BOOLEAN SimHidReadServed, SimHidBooted, SimHidBootable, SimHidBadStatus, SimHidLastLevel;
+static ULONG SimHidLevels, SimHidRequests, SimHidBadRequests, SimHidMultitouch;
+static UCHAR SimHidNextId;
+static const UCHAR SimHidStatusOk[4] = { 0xac, 0x27, 0x68, 0xd5 };
+static const UCHAR SimHidKeyboardDescriptor[] =
+{
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xc0
+};
+static UCHAR SimHidTrackpadDescriptor[300];
+
+static
+USHORT
+SimHidCrc(const UCHAR *Data, ULONG Length)
+{
+    ULONG Crc = 0, Index, Bit;
+
+    for (Index = 0; Index < Length; ++Index)
+    {
+        Crc ^= Data[Index];
+        for (Bit = 0; Bit < 8; ++Bit)
+            Crc = (Crc >> 1) ^ ((Crc & 1) ? 0xa001 : 0);
+    }
+    return (USHORT)Crc;
+}
+
+static
+VOID
+SimHidPut16(PUCHAR Data, ULONG Value)
+{
+    Data[0] = (UCHAR)Value;
+    Data[1] = (UCHAR)(Value >> 8);
+}
+
+static
+ULONG
+SimHidGet16(const UCHAR *Data)
+{
+    return Data[0] | (Data[1] << 8);
+}
+
+static
+VOID
+SimHidQueuePacket(UCHAR Flags, UCHAR Device, ULONG Offset, ULONG Remain, const UCHAR *Data, ULONG Length,
+                  BOOLEAN Corrupt)
+{
+    PUCHAR Packet = SimHidQueue[(SimHidQueueHead + SimHidQueueCount++) % RTL_NUMBER_OF(SimHidQueue)];
+
+    memset(Packet, 0, 256);
+    Packet[0] = Flags;
+    Packet[1] = Device;
+    SimHidPut16(Packet + 2, Offset);
+    SimHidPut16(Packet + 4, Remain);
+    SimHidPut16(Packet + 6, Length);
+    memcpy(Packet + 8, Data, Length);
+    SimHidPut16(Packet + 254, SimHidCrc(Packet, 254) ^ (Corrupt ? 1 : 0));
+}
+
+static
+VOID
+SimHidQueueMessage(UCHAR Flags, UCHAR Device, UCHAR Request, UCHAR Report, UCHAR SubDevice, const UCHAR *Payload,
+                   ULONG PayloadLength, BOOLEAN Corrupt)
+{
+    UCHAR Message[0x800];
+    ULONG MessageLength = 8 + PayloadLength + 2, Offset, Chunk;
+
+    Message[0] = Request;
+    Message[1] = Report;
+    Message[2] = SubDevice;
+    Message[3] = SimHidNextId++;
+    SimHidPut16(Message + 4, 0);
+    SimHidPut16(Message + 6, PayloadLength);
+    memcpy(Message + 8, Payload, PayloadLength);
+    SimHidPut16(Message + 8 + PayloadLength, SimHidCrc(Message, 8 + PayloadLength));
+    for (Offset = 0; Offset < MessageLength; Offset += Chunk)
+    {
+        Chunk = min(MessageLength - Offset, 246);
+        SimHidQueuePacket(Flags, Device, Offset, MessageLength - Offset - Chunk, Message + Offset, Chunk, Corrupt);
+    }
+}
+
+static
+VOID
+SimHidHostPacket(VOID)
+{
+    const UCHAR *Packet = SimHidMosi, *Message = SimHidMosi + 8;
+    ULONG Length = SimHidGet16(Packet + 6), PayloadLength;
+    UCHAR Payload[64] = { 0 };
+
+    SimHidRequests++;
+    if (Packet[0] != 0x40 || SimHidCrc(Packet, 254) != SimHidGet16(Packet + 254) || Length < 10 || Length > 246 ||
+        SimHidCrc(Message, Length - 2) != SimHidGet16(Message + Length - 2) ||
+        (PayloadLength = SimHidGet16(Message + 6)) + 10 != Length)
+    {
+        SimHidBadRequests++;
+        return;
+    }
+    if (Packet[1] == 0xd0 && Message[0] == 0x20 && Message[1] == 0x01 && Message[2] == 0xd0)
+    {
+        SimHidPut16(Payload + 4, 3);
+        SimHidPut16(Payload + 6, 0x05ac);
+        SimHidPut16(Payload + 8, 0x0341);
+        SimHidPut16(Payload + 10, 0x0123);
+        SimHidQueueMessage(0x40, 0xd0, 0x20, 0x01, 0xd0, Payload, 40, FALSE);
+    }
+    else if (Packet[1] == 0xd0 && Message[0] == 0x20 && Message[1] == 0x02 && Message[2] < 3)
+    {
+        static const CHAR *Names[] = { "mngt", "keyboard", "multi-touch" };
+        ULONG NameLength = (ULONG)strlen(Names[Message[2]]);
+
+        Payload[1] = Message[2];
+        Payload[5] = 0x21;
+        SimHidPut16(Payload + 6, Message[2] == 2 ? 0x400 : 0x40);
+        SimHidPut16(Payload + 12, 16);
+        SimHidPut16(Payload + 14, NameLength);
+        memcpy(Payload + 16, Names[Message[2]], NameLength);
+        SimHidQueueMessage(0x40, 0xd0, 0x20, 0x02, Message[2], Payload, 16 + NameLength, FALSE);
+    }
+    else if (Packet[1] == 0xd0 && Message[0] == 0x20 && Message[1] == 0x10 && Message[2] == 1)
+    {
+        SimHidQueueMessage(0x40, 0xd0, 0x20, 0x10, 1, SimHidKeyboardDescriptor, sizeof(SimHidKeyboardDescriptor),
+                           FALSE);
+    }
+    else if (Packet[1] == 0xd0 && Message[0] == 0x20 && Message[1] == 0x10 && Message[2] == 2)
+    {
+        SimHidQueueMessage(0x40, 0xd0, 0x20, 0x10, 2, SimHidTrackpadDescriptor, sizeof(SimHidTrackpadDescriptor),
+                           FALSE);
+    }
+    else if (Packet[1] == 2 && Message[0] == 0x52 && Message[1] == 0x02 && PayloadLength == 2 && Message[8] == 0x02 &&
+             Message[9] == 0x01)
+    {
+        SimHidMultitouch++;
+    }
+}
+
+static
+VOID
+SimHidSelect(BOOLEAN Asserted)
+{
+    if (Asserted)
+    {
+        SimHidMosiCount = SimHidMisoCount = SimHidStatusIndex = 0;
+        SimHidReadServed = FALSE;
+        return;
+    }
+    if (SimHidMosiCount == 256)
+        SimHidHostPacket();
+    if (SimHidReadServed && SimHidQueueCount)
+    {
+        SimHidQueueHead = (SimHidQueueHead + 1) % RTL_NUMBER_OF(SimHidQueue);
+        SimHidQueueCount--;
+    }
+}
+
+static
+VOID
+SimHidWriteByte(UCHAR Byte)
+{
+    if (SimHidMosiCount < sizeof(SimHidMosi))
+        SimHidMosi[SimHidMosiCount] = Byte;
+    SimHidMosiCount++;
+}
+
+static
+UCHAR
+SimHidReadByte(VOID)
+{
+    UCHAR Byte;
+
+    if (SimHidMosiCount == 256)
+    {
+        Byte = SimHidStatusOk[SimHidStatusIndex++ % sizeof(SimHidStatusOk)];
+        return SimHidBadStatus ? (UCHAR)~Byte : Byte;
+    }
+    SimHidReadServed = TRUE;
+    return SimHidQueueCount ? SimHidQueue[SimHidQueueHead][SimHidMisoCount++ % 256] : 0;
+}
+
+static
+BOOLEAN
+SimHidRequestLevel(VOID)
+{
+    return SimHidQueueCount == 0;
+}
+
+static
+VOID
+SimHidEnableWritten(ULONG Value)
+{
+    BOOLEAN Level = (Value & 1) != 0;
+
+    if ((Value & 0xe) != 2 || Level == SimHidLastLevel)
+        return;
+    SimHidLastLevel = Level;
+    SimHidLevels = (SimHidLevels << 1) | Level;
+    if ((SimHidLevels & 7) == 5 && SimHidBootable && !SimHidBooted)
+    {
+        static const UCHAR Booted[4] = { 0xa0, 0x80, 0x00, 0x00 };
+
+        SimHidBooted = TRUE;
+        SimHidQueuePacket(0x20, 0, 0, 0, Booted, sizeof(Booted), FALSE);
+    }
+}
+
+static const SIM_SPI_PERIPHERAL SimHidPeripheral = { SimHidSelect, SimHidWriteByte, SimHidReadByte };
+
+static UCHAR SimHidReport[0x800];
+static ULONG SimHidReportLength, SimHidReports;
+static UCHAR SimHidReportInterface;
+
+static
+VOID
+NTAPI
+SimHidReportRoutine(PVOID Context, UCHAR Interface, const UCHAR *Report, ULONG Length)
+{
+    SimHidReportInterface = Interface;
+    SimHidReportLength = Length;
+    memcpy(SimHidReport, Report, min(Length, sizeof(SimHidReport)));
+    SimHidReports++;
+}
+
+static
+ULONG
+SimHidTouchReport(PUCHAR Report, ULONG Fingers)
+{
+    ULONG Index;
+
+    memset(Report, 0, 8 + 38 + 30 * Fingers);
+    Report[0] = 0x02;
+    Report[8 + 22] = (UCHAR)Fingers;
+    for (Index = 0; Index < Fingers; ++Index)
+    {
+        SimHidPut16(Report + 8 + 38 + 30 * Index + 4, 1000 + Index);
+        SimHidPut16(Report + 8 + 38 + 30 * Index + 6, 2000 + Index);
+        SimHidPut16(Report + 8 + 38 + 30 * Index + 18, 300);
+    }
+    return 8 + 38 + 30 * Fingers;
+}
+
+static
+VOID
+ResetSpiHidSimulation(PFDT_DRIVER_TREE Tree, BOOLEAN Bootable)
+{
+    ULONG Index;
+
+    ResetSpiSimulation(Tree, TRUE);
+    SimSpiPeripheral = &SimHidPeripheral;
+    SimPinLevel = SimHidRequestLevel;
+    SimPinLevelPin = 6;
+    SimPinWritten = SimHidEnableWritten;
+    SimPinWatchPin = 194;
+    SimHidQueueHead = SimHidQueueCount = SimHidRequests = SimHidBadRequests = SimHidMultitouch = SimHidLevels = 0;
+    SimHidBooted = SimHidBadStatus = SimHidLastLevel = FALSE;
+    SimHidBootable = Bootable;
+    SimHidReports = 0;
+    for (Index = 0; Index < sizeof(SimHidTrackpadDescriptor); ++Index)
+        SimHidTrackpadDescriptor[Index] = (UCHAR)(Index * 7 + 3);
+}
+
+static
+VOID
+TestSpiHid(VOID)
+{
+    static SPIHID Hid;
+    static UCHAR Touch[0x800];
+    UCHAR Keys[10] = { 0x01, 0x02, 0x00, 0x04 };
+    UCHAR Status[5] = { 0xe0, 1, 2, 3, 4 }, Reset[2] = { 0x60, 0 };
+    FDT_DRIVER_TREE Tree;
+    ULONG Node, Length, Stalled;
+    NTSTATUS Status2;
+
+    ok(SpiHidCrc16((const UCHAR *)"123456789", 9) == 0xbb3d, "CRC-16/ARC of the check string is %04x\n",
+       SpiHidCrc16((const UCHAR *)"123456789", 9));
+
+    ResetSpiSimulation(&Tree, FALSE);
+    ok_hex(SpiHidOpen(&Tree, FindNode(&Tree, "apple,spi"), SimHidReportRoutine, NULL, &Hid), STATUS_NO_SUCH_DEVICE);
+
+    ResetSpiHidSimulation(&Tree, FALSE);
+    Node = FindNode(&Tree, "apple,spi");
+    ok_hex(SpiHidOpen(&Tree, Node, SimHidReportRoutine, NULL, &Hid), STATUS_SUCCESS);
+    ok_hex(SpiHidStart(&Hid), STATUS_DEVICE_NOT_READY);
+    ok(!Hid.Booted, "A controller that never booted is reported up\n");
+    SpiHidClose(&Hid);
+
+    ResetSpiHidSimulation(&Tree, TRUE);
+    ok_hex(SpiHidOpen(&Tree, Node, SimHidReportRoutine, NULL, &Hid), STATUS_SUCCESS);
+    ok_int(Hid.SpeedHz, 8000000);
+    ok(Hid.CsSetupUs == 65 && Hid.CsHoldUs == 65 && Hid.CsInactiveUs == 250, "Chip select delays %lu %lu %lu\n",
+       Hid.CsSetupUs, Hid.CsHoldUs, Hid.CsInactiveUs);
+    ok(Hid.Enable.Pin == 194 && !Hid.Enable.ActiveLow && Hid.Interrupt.Pin == 6 && Hid.Interrupt.ActiveLow,
+       "Enable pin %lu, request pin %lu\n", Hid.Enable.Pin, Hid.Interrupt.Pin);
+    Status2 = SpiHidStart(&Hid);
+    ok_hex(Status2, STATUS_SUCCESS);
+    ok_hex(PINCTRL(6 * 4) & 0x20e, 0x20e);
+    ok_hex(PINCTRL(194 * 4) & 0xf, 0x3);
+    ok(Hid.Booted && Hid.VendorId == 0x05ac && Hid.ProductId == 0x0341 && Hid.Version == 0x0123 &&
+       Hid.DeviceCount == 3, "Controller %04x:%04x version %04x with %lu interfaces\n", Hid.VendorId, Hid.ProductId,
+       Hid.Version, Hid.DeviceCount);
+    ok(!strcmp(Hid.Interfaces[1].Name, "keyboard") && !strcmp(Hid.Interfaces[2].Name, "multi-touch"),
+       "Interfaces %s and %s\n", Hid.Interfaces[1].Name, Hid.Interfaces[2].Name);
+    ok(Hid.Interfaces[2].MaxInputReport == 0x400 && Hid.Interfaces[1].Country == 0x21, "Interface details\n");
+    ok(Hid.Interfaces[1].DescriptorLength == sizeof(SimHidKeyboardDescriptor) &&
+       !memcmp(Hid.Interfaces[1].Descriptor, SimHidKeyboardDescriptor, sizeof(SimHidKeyboardDescriptor)),
+       "The keyboard descriptor is %lu bytes\n", Hid.Interfaces[1].DescriptorLength);
+    ok(Hid.Interfaces[2].DescriptorLength == sizeof(SimHidTrackpadDescriptor) &&
+       !memcmp(Hid.Interfaces[2].Descriptor, SimHidTrackpadDescriptor, sizeof(SimHidTrackpadDescriptor)),
+       "The trackpad descriptor over two packets is %lu bytes\n", Hid.Interfaces[2].DescriptorLength);
+    ok(SimHidBadRequests == 0 && SimHidRequests == 6, "%lu requests, %lu malformed\n", SimHidRequests,
+       SimHidBadRequests);
+    ok(Hid.BadPackets == 0 && Hid.BadStatus == 0, "%lu bad packets, %lu bad statuses\n", Hid.BadPackets,
+       Hid.BadStatus);
+    ok_int(SPIREG(0x030), 3);
+    ok_hex(SPIREG(0x00c), 2);
+    ok(!SimSpiOverflow, "The transmit FIFO overflowed\n");
+
+    ok_hex(SpiHidEnableMultitouch(&Hid), STATUS_SUCCESS);
+    ok_int(SimHidMultitouch, 1);
+
+    SimHidQueueMessage(0x20, 1, 0x10, 0x01, 0x00, Keys, sizeof(Keys), FALSE);
+    ok(SpiHidPoll(&Hid), "A pending keyboard report was not read\n");
+    ok(SimHidReports == 1 && SimHidReportInterface == 1 && SimHidReportLength == sizeof(Keys) &&
+       !memcmp(SimHidReport, Keys, sizeof(Keys)), "The keyboard report did not arrive\n");
+    ok(!SpiHidPoll(&Hid), "A read happened with the request line released\n");
+
+    SimHidReports = 0;
+    Length = SimHidTouchReport(Touch, 2);
+    SimHidQueueMessage(0x20, 2, 0x10, 0x02, 0x00, Touch, Length, FALSE);
+    while (SpiHidPoll(&Hid))
+        ;
+    ok(SimHidReports == 1 && SimHidReportInterface == 2 && SimHidReportLength == Length && SimHidReport[30] == 2,
+       "The two-finger report did not arrive\n");
+    SimHidReports = 0;
+    Length = SimHidTouchReport(Touch, 9);
+    SimHidQueueMessage(0x20, 2, 0x10, 0x02, 0x00, Touch, Length, FALSE);
+    ok_int(SimHidQueueCount, 2);
+    while (SpiHidPoll(&Hid))
+        ;
+    ok(SimHidReports == 1 && SimHidReportLength == Length && !memcmp(SimHidReport, Touch, Length),
+       "The nine-finger report over two packets is %lu bytes\n", SimHidReportLength);
+
+    SimHidReports = 0;
+    SimHidQueueMessage(0x20, 1, 0x10, 0x01, 0x00, Keys, sizeof(Keys), TRUE);
+    SimHidQueueMessage(0x20, 1, 0x10, 0x01, 0x00, Keys, sizeof(Keys), FALSE);
+    while (SpiHidPoll(&Hid))
+        ;
+    ok(SimHidReports == 1 && Hid.BadPackets == 1, "%lu reports, %lu bad packets\n", SimHidReports, Hid.BadPackets);
+
+    SimHidReports = 0;
+    SimHidQueueMessage(0x20, 0, 0x10, 0xe0, 0x00, Status, sizeof(Status), FALSE);
+    SimHidQueueMessage(0x20, 2, 0x10, 0x60, 0x00, Reset, sizeof(Reset), FALSE);
+    while (SpiHidPoll(&Hid))
+        ;
+    ok(SimHidReports == 0 && Hid.TrackpadResetSeen, "%lu reports passed on, reset %u\n", SimHidReports,
+       Hid.TrackpadResetSeen);
+    ok_hex(SpiHidEnableMultitouch(&Hid), STATUS_SUCCESS);
+    ok(SimHidMultitouch == 2 && !Hid.TrackpadResetSeen, "Multi-touch was not asked for again\n");
+
+    SimHidBadStatus = TRUE;
+    ok_hex(SpiHidEnableMultitouch(&Hid), STATUS_DEVICE_PROTOCOL_ERROR);
+    ok_int(Hid.BadStatus, 1);
+    SimHidBadStatus = FALSE;
+
+    Stalled = SimStalledMicroseconds;
+    SimHidQueueMessage(0x20, 1, 0x10, 0x01, 0x00, Keys, sizeof(Keys), FALSE);
+    ok(SpiHidPoll(&Hid), "A pending keyboard report was not read\n");
+    ok(SimStalledMicroseconds - Stalled >= 65 + 65 + 250, "A read stalled only %lu us\n",
+       SimStalledMicroseconds - Stalled);
+
+    SpiHidClose(&Hid);
+    ok_hex(PINCTRL(194 * 4) & 1, 0);
+    ok(!SpiHidPoll(&Hid), "A closed transport read a packet\n");
+    ok_int(SimMapCount, 0);
+    SimSpiPeripheral = NULL;
+    SimPinLevel = NULL;
+    SimPinWritten = NULL;
 }
 
 static
@@ -5146,4 +5546,5 @@ START_TEST(AppleSoc)
     TestAcePd();
     TestSpi();
     TestGpioInterrupt();
+    TestSpiHid();
 }

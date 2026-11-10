@@ -1,7 +1,7 @@
 /*
  * PROJECT:     LiberNT Apple MTP HID Transport Driver
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
- * PURPOSE:     Internal keyboard of Apple silicon laptops behind the MTP coprocessor and DockChannel
+ * PURPOSE:     Internal keyboard and trackpad of Apple silicon laptops over MTP DockChannel or SPI
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
  */
 
@@ -12,6 +12,7 @@
 #include <reactos/drivers/applertkit.h>
 #include <reactos/drivers/applesmc.h>
 #include <reactos/drivers/dumpstor.h>
+#include "spihid.h"
 
 #define MTP_TAG 'pTMA'
 
@@ -93,6 +94,10 @@
 #define MTP_BOOT_TIMEOUT_MS         2000
 #define MTP_KEYBOARD_TIMEOUT_MS     4000
 #define MTP_MAX_BUFFERS             8
+
+#define SPI_TP_REPORT_ID            0x02
+#define SPI_TP_MOUSE_HEADER         8
+#define SPI_POLL_BURST              32
 
 #pragma pack(push, 1)
 typedef struct _DCHID_HEADER
@@ -180,6 +185,9 @@ typedef struct _MTP_DEVICE
     PDEVICE_OBJECT Pdo;
 
     FDT_DRIVER_TREE Tree;
+
+    BOOLEAN SpiTransport;
+    SPIHID SpiHid;
 
     PUCHAR Asc;
     ULONG AscSize;
@@ -969,25 +977,17 @@ MtpHandleEvent(
 
 static
 VOID
-MtpCaptureDebuggerKeyboard(
-    _Inout_ PMTP_DEVICE Device)
+MtpCaptureDebuggerReport(
+    _Inout_ PMTP_DEVICE Device,
+    _In_reads_bytes_(Length) const UCHAR *Payload,
+    _In_ ULONG Length)
 {
-    const DCHID_HEADER *Header = (const DCHID_HEADER *)Device->Packet;
-    const DCHID_SUBHEADER *Sub = (const DCHID_SUBHEADER *)(Device->Packet + sizeof(*Header));
-    const UCHAR *Payload = (const UCHAR *)(Sub + 1);
     ULONG Base = Device->KeyboardUsesReportIds ? 1 : 0;
     ULONG Index;
 
-    if (MtpChecksum(Device->Packet, sizeof(*Header) + Header->Length + 4) != 0xffffffff ||
-        Header->Channel == DCHID_CHANNEL_CMD || Header->Interface != Device->KeyboardInterface ||
-        Header->Length < sizeof(*Sub) || Sub->Length + sizeof(*Sub) > Header->Length ||
-        (Sub->Flags >> 6) != DCHID_REPORT_INPUT)
-    {
-        return;
-    }
-    if ((Base && (Sub->Length < 1 || Payload[0] != Device->DebuggerReportId)) ||
-        Sub->Length < Base + Device->DebuggerModifierOffset + 1 ||
-        Sub->Length < Base + Device->DebuggerKeysOffset + Device->DebuggerKeysCount)
+    if ((Base && (Length < 1 || Payload[0] != Device->DebuggerReportId)) ||
+        Length < Base + Device->DebuggerModifierOffset + 1 ||
+        Length < Base + Device->DebuggerKeysOffset + Device->DebuggerKeysCount)
     {
         return;
     }
@@ -997,6 +997,25 @@ MtpCaptureDebuggerKeyboard(
     for (Index = 0; Index < Device->DebuggerKeysCount; ++Index)
         Device->DebuggerReport[2 + Index] = Payload[Base + Device->DebuggerKeysOffset + Index];
     Device->DebuggerReportValid = TRUE;
+}
+
+static
+VOID
+MtpCaptureDebuggerKeyboard(
+    _Inout_ PMTP_DEVICE Device)
+{
+    const DCHID_HEADER *Header = (const DCHID_HEADER *)Device->Packet;
+    const DCHID_SUBHEADER *Sub = (const DCHID_SUBHEADER *)(Device->Packet + sizeof(*Header));
+    const UCHAR *Payload = (const UCHAR *)(Sub + 1);
+
+    if (MtpChecksum(Device->Packet, sizeof(*Header) + Header->Length + 4) != 0xffffffff ||
+        Header->Channel == DCHID_CHANNEL_CMD || Header->Interface != Device->KeyboardInterface ||
+        Header->Length < sizeof(*Sub) || Sub->Length + sizeof(*Sub) > Header->Length ||
+        (Sub->Flags >> 6) != DCHID_REPORT_INPUT)
+    {
+        return;
+    }
+    MtpCaptureDebuggerReport(Device, Payload, Sub->Length);
 }
 
 static
@@ -1492,6 +1511,131 @@ MtpWorker(
 
 static
 VOID
+NTAPI
+MtpSpiReport(
+    _In_ PVOID Context,
+    _In_ UCHAR Interface,
+    _In_reads_bytes_(Length) const UCHAR *Report,
+    _In_ ULONG Length)
+{
+    PMTP_DEVICE Device = Context;
+
+    if (Interface == SPIHID_INTERFACE_KEYBOARD)
+    {
+        if (Device->DebuggerPolling)
+            MtpCaptureDebuggerReport(Device, Report, Length);
+        else if (Device->Started)
+            MtpQueueKeyboardReport(Device, Report, Length);
+    }
+    else if (Interface == SPIHID_INTERFACE_TRACKPAD && Device->TouchReady && Device->Started &&
+             !Device->DebuggerPolling)
+    {
+        /* Report 2: an 8-byte mouse report, then the multi-touch frame the MTP trackpads send. */
+        if (Length > SPI_TP_MOUSE_HEADER && Report[0] == SPI_TP_REPORT_ID)
+            MtpTranslateTouch(Device, Report + SPI_TP_MOUSE_HEADER, Length - SPI_TP_MOUSE_HEADER);
+    }
+}
+
+static
+VOID
+NTAPI
+MtpSpiWorker(
+    _In_ PVOID Context)
+{
+    PMTP_DEVICE Device = Context;
+    LARGE_INTEGER Interval;
+    ULONG Burst;
+
+    Interval.QuadPart = -10000;
+    while (!Device->Stop)
+    {
+        /* A request line held asserted must not starve the stop request. */
+        for (Burst = 0; Burst < SPI_POLL_BURST && !Device->Stop && SpiHidPoll(&Device->SpiHid); ++Burst)
+            ;
+        if (Device->SpiHid.TrackpadResetSeen && Device->TouchReady)
+        {
+            DbgPrint("applemtp: the trackpad reset itself, asking for multi-touch reports again\n");
+            SpiHidEnableMultitouch(&Device->SpiHid);
+        }
+        KeWaitForSingleObject(&Device->StopEvent, Executive, KernelMode, FALSE, &Interval);
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static NTSTATUS MtpBuildReportDescriptor(_Inout_ PMTP_DEVICE Device);
+static VOID MtpRegisterDebuggerKeyboard(_Inout_ PMTP_DEVICE Device);
+
+static
+NTSTATUS
+MtpStartSpiHardware(
+    _Inout_ PMTP_DEVICE Device)
+{
+    PSPIHID_INTERFACE Keyboard = &Device->SpiHid.Interfaces[SPIHID_INTERFACE_KEYBOARD];
+    PMTP_INTERFACE Interface = &Device->Interfaces[SPIHID_INTERFACE_KEYBOARD];
+    HANDLE ThreadHandle;
+    NTSTATUS Status;
+
+    Status = SpiHidOpen(&Device->Tree, Device->Tree.Node, MtpSpiReport, Device, &Device->SpiHid);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Device->SpiTransport = TRUE;
+    Status = SpiHidStart(&Device->SpiHid);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint("applemtp: the SPI keyboard did not come up: %lx\n", Status);
+        return Status;
+    }
+
+    Interface->Descriptor = ExAllocatePoolWithTag(NonPagedPool, Keyboard->DescriptorLength, MTP_TAG);
+    if (!Interface->Descriptor)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(Interface->Descriptor, Keyboard->Descriptor, Keyboard->DescriptorLength);
+    Interface->DescriptorLength = Keyboard->DescriptorLength;
+    RtlCopyMemory(Interface->Name, "keyboard", sizeof("keyboard"));
+    Interface->Present = Interface->InitComplete = Interface->Enabled = Interface->Ready = TRUE;
+    Device->KeyboardInterface = SPIHID_INTERFACE_KEYBOARD;
+    Device->StmId.VendorId = Device->SpiHid.VendorId;
+    Device->StmId.ProductId = Device->SpiHid.ProductId;
+    Device->StmId.Version = Device->SpiHid.Version;
+    Device->IdReady = TRUE;
+
+    if (Device->SpiHid.DeviceCount > SPIHID_INTERFACE_TRACKPAD &&
+        Device->SpiHid.Interfaces[SPIHID_INTERFACE_TRACKPAD].DescriptorLength)
+    {
+        Status = SpiHidEnableMultitouch(&Device->SpiHid);
+        if (NT_SUCCESS(Status))
+        {
+            Device->TouchInterface = SPIHID_INTERFACE_TRACKPAD;
+            Device->TouchReady = TRUE;
+        }
+        else
+        {
+            DbgPrint("applemtp: the trackpad refused multi-touch reports: %lx\n", Status);
+        }
+    }
+
+    Status = MtpBuildReportDescriptor(Device);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    KeInitializeEvent(&Device->StopEvent, NotificationEvent, FALSE);
+    Device->Stop = 0;
+    Status = PsCreateSystemThread(&ThreadHandle, THREAD_ALL_ACCESS, NULL, NULL, NULL, MtpSpiWorker, Device);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    ObReferenceObjectByHandle(ThreadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)&Device->Thread, NULL);
+    ZwClose(ThreadHandle);
+
+    Device->Started = TRUE;
+    DbgPrint("applemtp: SPI keyboard %04x:%04x is up%s, report descriptor %lu bytes\n", Device->SpiHid.VendorId,
+             Device->SpiHid.ProductId, Device->TouchReady ? " with its trackpad" : "",
+             Device->ReportDescriptorLength);
+    MtpRegisterDebuggerKeyboard(Device);
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
 MtpFindDebuggerKeyboardLayout(
     _Inout_ PMTP_DEVICE Device)
 {
@@ -1590,12 +1734,23 @@ MtpDebuggerKeyboardPoll(
     *ReturnedLength = 0;
     if (Length < ROS_USB_KEYBOARD_BOOT_REPORT_SIZE)
         return STATUS_BUFFER_TOO_SMALL;
-    if (!Device->Started || !Device->Data || !Device->Packet || !Device->DebuggerLayoutKnown)
+    if (!Device->Started || !Device->DebuggerLayoutKnown ||
+        (!Device->SpiTransport && (!Device->Data || !Device->Packet)))
         return STATUS_DEVICE_NOT_READY;
 
     Device->DebuggerReportValid = FALSE;
     Device->DebuggerPolling = TRUE;
-    MtpPollFifo(Device);
+    if (Device->SpiTransport)
+    {
+        ULONG Burst;
+
+        for (Burst = 0; Burst < SPI_POLL_BURST && !Device->DebuggerReportValid && SpiHidPoll(&Device->SpiHid); ++Burst)
+            ;
+    }
+    else
+    {
+        MtpPollFifo(Device);
+    }
     Device->DebuggerPolling = FALSE;
     if (!Device->DebuggerReportValid)
         return STATUS_NO_DATA_DETECTED;
@@ -1790,6 +1945,11 @@ MtpTeardown(
 {
     ULONG Index;
 
+    if (Device->SpiTransport)
+        SpiHidClose(&Device->SpiHid);
+    Device->SpiTransport = FALSE;
+    Device->TouchReady = FALSE;
+    Device->IdReady = FALSE;
     if (Device->Dart && Device->DartReady)
         MtpWrite32(Device->Dart, DART_T8110_TCR + 4 * Device->DartSid, 0);
     Device->DartReady = FALSE;
@@ -1840,6 +2000,8 @@ MtpStartHardware(
         DbgPrint("applemtp: device tree unavailable: %lx\n", Status);
         return Status;
     }
+    if (FdtDriverFindChild(&Device->Tree, Device->Tree.Node, "apple,spi-hid-transport") != FDT_NO_NODE)
+        return MtpStartSpiHardware(Device);
     FifoNode = Device->Tree.Node;
     HidNode = FdtDriverFindChild(&Device->Tree, FifoNode, "apple,dockchannel-hid");
     if (HidNode == FDT_NO_NODE ||
