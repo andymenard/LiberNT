@@ -208,6 +208,8 @@ MockIoOpenDeviceRegistryKey(PDEVICE_OBJECT DeviceObject, ULONG KeyType, ACCESS_M
 #define SIM_MCA_SWITCH_BASE 0x28b300000ULL
 #define SIM_MCA_SWITCH_SIZE 0x20000
 #define SIM_MAILBOX_BASE    0x292408000ULL
+#define SIM_SPI_BASE        0x39b10c000ULL
+#define SIM_SPI_INDEX       17
 #define SIM_MAILBOX_INDEX   16
 #define SIM_I2C_INDEX       11
 #define SIM_NCO_INDEX       12
@@ -239,6 +241,7 @@ static ULONG SimAdmacData[SIM_ADMAC_SIZE / sizeof(ULONG)];
 static ULONG SimMcaData[SIM_MCA_SIZE / sizeof(ULONG)];
 static ULONG SimMcaSwitchData[SIM_MCA_SWITCH_SIZE / sizeof(ULONG)];
 static ULONG SimMailboxData[SIM_REGION_SIZE / sizeof(ULONG)];
+static ULONG SimSpiData[SIM_REGION_SIZE / sizeof(ULONG)];
 
 typedef struct _SIM_WRITE
 {
@@ -265,6 +268,7 @@ static SIM_REGION SimRegions[] =
     { SIM_MCA_BASE, sizeof(SimMcaData), SimMcaData },
     { SIM_MCA_SWITCH_BASE, sizeof(SimMcaSwitchData), SimMcaSwitchData },
     { SIM_MAILBOX_BASE, sizeof(SimMailboxData), SimMailboxData },
+    { SIM_SPI_BASE, sizeof(SimSpiData), SimSpiData },
 };
 static SIM_WRITE SimWrites[256];
 static BOOLEAN SimAtcStuck;
@@ -731,6 +735,100 @@ SimMboxSent(
     return FALSE;
 }
 
+typedef struct _SIM_SPI_PERIPHERAL
+{
+    VOID (*Select)(BOOLEAN Asserted);
+    VOID (*Mosi)(UCHAR Byte);
+    UCHAR (*Miso)(VOID);
+} SIM_SPI_PERIPHERAL;
+
+static const SIM_SPI_PERIPHERAL *SimSpiPeripheral;
+static UCHAR SimSpiTxFifo[16], SimSpiRxFifo[16];
+static ULONG SimSpiTxLevel, SimSpiRxLevel, SimSpiTxDone, SimSpiRxDone;
+static BOOLEAN SimSpiRunning, SimSpiStuck, SimSpiOverflow, SimSpiSelected;
+
+#define SPIREG(Offset) SimRegions[SIM_SPI_INDEX].Data[(Offset) / sizeof(ULONG)]
+
+static
+VOID
+SimSpiProgress(VOID)
+{
+    if (!SimSpiRunning || SimSpiStuck)
+        return;
+    while (SimSpiTxLevel && SimSpiTxDone < SPIREG(0x4c))
+    {
+        if (SimSpiPeripheral)
+            SimSpiPeripheral->Mosi(SimSpiTxFifo[0]);
+        memmove(SimSpiTxFifo, SimSpiTxFifo + 1, --SimSpiTxLevel);
+        SimSpiTxDone++;
+    }
+    while (SimSpiRxDone < SPIREG(0x34) && SimSpiRxLevel < RTL_NUMBER_OF(SimSpiRxFifo))
+    {
+        SimSpiRxFifo[SimSpiRxLevel++] = SimSpiPeripheral ? SimSpiPeripheral->Miso() : 0xff;
+        SimSpiRxDone++;
+    }
+}
+
+static
+ULONG
+SimSpiRead(ULONG Offset)
+{
+    UCHAR Byte;
+
+    SimSpiProgress();
+    switch (Offset)
+    {
+        case 0x10c:
+            return (SimSpiTxLevel << 8) | (SimSpiRxLevel << 24);
+        case 0x134:
+            return ((SPIREG(0x4c) && SimSpiTxDone == SPIREG(0x4c)) ? 2 : 0) |
+                   ((SPIREG(0x34) && SimSpiRxDone == SPIREG(0x34)) ? 1 : 0);
+        case 0x13c:
+            return SimSpiOverflow ? 0x20000 : 0;
+        case 0x20:
+            Byte = SimSpiRxFifo[0];
+            if (SimSpiRxLevel)
+                memmove(SimSpiRxFifo, SimSpiRxFifo + 1, --SimSpiRxLevel);
+            return Byte;
+    }
+    return SPIREG(Offset);
+}
+
+static
+VOID
+SimSpiWrite(ULONG Offset, ULONG Value)
+{
+    switch (Offset)
+    {
+        case 0x000:
+            if (Value & 0xc)
+                SimSpiTxLevel = SimSpiRxLevel = 0;
+            SimSpiRunning = (Value & 1) != 0;
+            break;
+        case 0x00c:
+            if (SimSpiSelected != !(Value & 2) && SimSpiPeripheral)
+                SimSpiPeripheral->Select(!(Value & 2));
+            SimSpiSelected = !(Value & 2);
+            break;
+        case 0x010:
+            if (SimSpiTxLevel == RTL_NUMBER_OF(SimSpiTxFifo))
+                SimSpiOverflow = TRUE;
+            else
+                SimSpiTxFifo[SimSpiTxLevel++] = (UCHAR)Value;
+            return;
+        case 0x034:
+            SimSpiRxDone = 0;
+            break;
+        case 0x04c:
+            SimSpiTxDone = 0;
+            break;
+    }
+    SPIREG(Offset) = Value;
+}
+
+static ULONG SimPinLevelPin = MAXULONG;
+static BOOLEAN (*SimPinLevel)(VOID);
+
 static
 ULONG
 SimRead(volatile ULONG *Address)
@@ -746,6 +844,10 @@ SimRead(volatile ULONG *Address)
         return SimI2cRead(Offset);
     if (Region == &SimRegions[SIM_ADMAC_INDEX])
         return SimAdmacRead(Offset);
+    if (Region == &SimRegions[SIM_SPI_INDEX])
+        return SimSpiRead(Offset);
+    if (Region == &SimRegions[9] && SimPinLevel && Offset == SimPinLevelPin * sizeof(ULONG))
+        return (Region->Data[Offset / sizeof(ULONG)] & ~1u) | (SimPinLevel() ? 1 : 0);
     if (Region == &SimRegions[2])
     {
         if (Offset == 0x00)
@@ -921,6 +1023,11 @@ SimWrite(volatile ULONG *Address, ULONG Value)
         SimAdmacWrite(Offset, Value);
         return;
     }
+    if (Region == &SimRegions[SIM_SPI_INDEX])
+    {
+        SimSpiWrite(Offset, Value);
+        return;
+    }
     if (Region == &SimRegions[SIM_MCA_INDEX] && ((Offset % 0x4000) == 0x300 || (Offset % 0x4000) == 0x400) &&
         (Value & 2) && !SimMcaStuck)
         Value &= ~2;
@@ -1007,6 +1114,7 @@ UatSleepMs(ULONG Milliseconds)
 #include "../../../../sdk/lib/drivers/applertkit/pcie.c"
 #include "../../../../sdk/lib/drivers/applertkit/gpio.c"
 #include "../../../../sdk/lib/drivers/applertkit/i2c.c"
+#include "../../../../sdk/lib/drivers/applertkit/spi.c"
 #include "../../../../sdk/lib/drivers/applertkit/nco.c"
 #include "../../../../sdk/lib/drivers/applertkit/admac.c"
 #include "../../../../sdk/lib/drivers/applertkit/mca.c"
@@ -4017,6 +4125,8 @@ TestPcie(VOID)
 #define PHANDLE_ADMAC       0x2c
 #define PHANDLE_MCA0_PD     0x2d
 #define PHANDLE_NCO_REF     0x62
+#define PHANDLE_SPI3_PD     0x63
+#define PHANDLE_PINCTRL_NOIRQ 0x64
 
 static ULONG SimTranslateCalls;
 
@@ -4495,6 +4605,267 @@ SimAceSet(UCHAR Register, const UCHAR *Data, UCHAR Length)
 
 static
 VOID
+BuildSpiTree(BOOLEAN Transport)
+{
+    memset(&Builder, 0, sizeof(Builder));
+    FdtBeginNode("");
+    FdtCells("#address-cells", 1, 2);
+    FdtCells("#size-cells", 1, 2);
+    FdtBeginNode("clock-ref");
+    FdtStrings("compatible", LIST("fixed-clock"));
+    FdtCells("clock-frequency", 1, 24000000);
+    FdtCells("phandle", 1, PHANDLE_CLKREF);
+    FdtEndNode();
+    FdtBeginNode("soc");
+    FdtStrings("compatible", LIST("simple-bus"));
+    FdtCells("#address-cells", 1, 2);
+    FdtCells("#size-cells", 1, 2);
+    FdtProperty("ranges", NULL, 0);
+
+    FdtBeginNode("power-management@292280000");
+    FdtStrings("compatible", LIST("apple,t6000-pmgr"));
+    FdtCells("#address-cells", 1, 1);
+    FdtCells("#size-cells", 1, 1);
+    FdtCells("reg", 4, 2, 0x92280000, 0, 0x4000);
+    FdtBeginNode("power-controller@260");
+    FdtStrings("compatible", LIST("apple,t6000-pmgr-pwrstate\0apple,pmgr-pwrstate"));
+    FdtCells("reg", 2, 0x260, 4);
+    FdtCells("phandle", 1, PHANDLE_SPI3_PD);
+    FdtEndNode();
+    FdtEndNode();
+
+    FdtBeginNode("pinctrl@347100000");
+    FdtStrings("compatible", LIST("apple,t6000-pinctrl\0apple,pinctrl"));
+    FdtCells("reg", 4, 3, 0x47100000, 0, 0x4000);
+    FdtCells("#gpio-cells", 1, 2);
+    FdtCells("#interrupt-cells", 1, 2);
+    FdtCells("apple,npins", 1, 0xe0);
+    FdtCells("phandle", 1, PHANDLE_PINCTRL);
+    FdtEndNode();
+
+    FdtBeginNode("pinctrl@347200000");
+    FdtStrings("compatible", LIST("apple,t6000-pinctrl\0apple,pinctrl"));
+    FdtCells("reg", 4, 3, 0x47100000, 0, 0x4000);
+    FdtCells("#gpio-cells", 1, 2);
+    FdtCells("apple,npins", 1, 0xe0);
+    FdtCells("phandle", 1, PHANDLE_PINCTRL_NOIRQ);
+    FdtEndNode();
+
+    FdtBeginNode("button-low");
+    FdtStrings("compatible", LIST("test,button"));
+    FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL, 6, 8);
+    FdtEndNode();
+    FdtBeginNode("button-falling");
+    FdtStrings("compatible", LIST("test,button-falling"));
+    FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL, 7, 2);
+    FdtEndNode();
+    FdtBeginNode("button-high");
+    FdtStrings("compatible", LIST("test,button-high"));
+    FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL, 8, 4);
+    FdtEndNode();
+    FdtBeginNode("button-noirq");
+    FdtStrings("compatible", LIST("test,button-noirq"));
+    FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL_NOIRQ, 6, 8);
+    FdtEndNode();
+    FdtBeginNode("button-beyond");
+    FdtStrings("compatible", LIST("test,button-beyond"));
+    FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL, 0xe0, 8);
+    FdtEndNode();
+
+    FdtBeginNode("spi@39b10c000");
+    FdtStrings("compatible", LIST("apple,t6000-spi\0apple,spi"));
+    FdtCells("reg", 4, 3, 0x9b10c000, 0, 0x4000);
+    FdtCells("clocks", 1, PHANDLE_CLKREF);
+    FdtCells("power-domains", 1, PHANDLE_SPI3_PD);
+    FdtCells("#address-cells", 1, 1);
+    FdtCells("#size-cells", 1, 0);
+    if (Transport)
+    {
+        FdtBeginNode("hid-transport@0");
+        FdtStrings("compatible", LIST("apple,spi-hid-transport"));
+        FdtCells("reg", 1, 0);
+        FdtCells("spi-max-frequency", 1, 8000000);
+        FdtCells("spi-cs-setup-delay-ns", 1, 65000);
+        FdtCells("spi-cs-hold-delay-ns", 1, 65000);
+        FdtCells("spi-cs-inactive-delay-ns", 1, 250000);
+        FdtCells("spien-gpios", 3, PHANDLE_PINCTRL, 194, 0);
+        FdtCells("interrupts-extended", 3, PHANDLE_PINCTRL, 6, 8);
+        FdtEndNode();
+    }
+    FdtEndNode();
+
+    FdtEndNode();
+    FdtEndNode();
+    FdtFinish();
+}
+
+static
+VOID
+ResetSpiSimulation(PFDT_DRIVER_TREE Tree, BOOLEAN Transport)
+{
+    ResetSimulation(Tree);
+    SimSpiPeripheral = NULL;
+    SimSpiTxLevel = SimSpiRxLevel = SimSpiTxDone = SimSpiRxDone = 0;
+    SimSpiRunning = SimSpiStuck = SimSpiOverflow = SimSpiSelected = FALSE;
+    SimPinLevel = NULL;
+    SimPinLevelPin = MAXULONG;
+    BuildSpiTree(Transport);
+    ok(Builder.StructureSize < sizeof(Builder.Structure) && Builder.StringsSize < sizeof(Builder.Strings),
+       "The SPI tree overflowed the builder (%lu, %lu)\n", Builder.StructureSize, Builder.StringsSize);
+    memset(Tree, 0, sizeof(*Tree));
+    Tree->Blob = Builder.Blob;
+    ok(FdtOpen(Builder.Blob, Builder.BlobSize, &Tree->Fdt), "The SPI tree did not open\n");
+}
+
+static UCHAR SimEchoMosi[64], SimEchoMiso[64];
+static ULONG SimEchoMosiCount, SimEchoMisoCount, SimEchoSelects;
+
+static
+VOID
+SimEchoSelect(BOOLEAN Asserted)
+{
+    if (Asserted)
+        SimEchoSelects++;
+}
+
+static
+VOID
+SimEchoWrite(UCHAR Byte)
+{
+    if (SimEchoMosiCount < sizeof(SimEchoMosi))
+        SimEchoMosi[SimEchoMosiCount] = Byte;
+    SimEchoMosiCount++;
+}
+
+static
+UCHAR
+SimEchoRead(VOID)
+{
+    return SimEchoMiso[SimEchoMisoCount++ % sizeof(SimEchoMiso)];
+}
+
+static const SIM_SPI_PERIPHERAL SimEcho = { SimEchoSelect, SimEchoWrite, SimEchoRead };
+
+static
+VOID
+TestSpi(VOID)
+{
+    FDT_DRIVER_TREE Tree;
+    APPLE_SPI Spi;
+    UCHAR Out[40], In[40];
+    ULONG Node, Index;
+    NTSTATUS Status;
+
+    ResetSpiSimulation(&Tree, FALSE);
+    SimSpiPeripheral = &SimEcho;
+    SimEchoMosiCount = SimEchoMisoCount = SimEchoSelects = 0;
+    for (Index = 0; Index < sizeof(SimEchoMiso); ++Index)
+        SimEchoMiso[Index] = (UCHAR)(0xa0 + Index);
+    for (Index = 0; Index < sizeof(Out); ++Index)
+        Out[Index] = (UCHAR)(Index * 3 + 1);
+
+    ok_hex(AppleSpiOpen(&Tree, FindNode(&Tree, "apple,t6000-pinctrl"), &Spi), STATUS_NOT_SUPPORTED);
+    Node = FindNode(&Tree, "apple,spi");
+    Status = AppleSpiOpen(&Tree, Node, &Spi);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(Spi.ReferenceHz, 24000000);
+    ok_hex(PMGR(0x260) & 0xf, 0xf);
+    ok_hex(SPIREG(0x00c), 2);
+    ok_hex(SPIREG(0x004), 0x20);
+    ok_hex(SPIREG(0x138), 0);
+    ok_hex(SPIREG(0x130), 0);
+
+    AppleSpiSetChipSelect(&Spi, TRUE);
+    ok_hex(SPIREG(0x00c), 0);
+    ok_int(SimEchoSelects, 1);
+    Status = AppleSpiTransfer(&Spi, 8000000, Out, NULL, sizeof(Out));
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(SimEchoMosiCount, sizeof(Out));
+    ok(!memcmp(SimEchoMosi, Out, sizeof(Out)), "The bytes sent differ from the bytes written\n");
+    ok_int(SPIREG(0x030), 3);
+    ok_int(SPIREG(0x04c), sizeof(Out));
+    ok_int(SPIREG(0x034), 0);
+    ok_hex(SPIREG(0x150) & 0x003f0000, 8 << 16);
+    ok_hex(SPIREG(0x000), 0);
+    ok(!SimSpiOverflow, "The transmit FIFO overflowed\n");
+
+    memset(In, 0, sizeof(In));
+    Status = AppleSpiTransfer(&Spi, 8000000, NULL, In, sizeof(In));
+    ok_hex(Status, STATUS_SUCCESS);
+    ok(In[0] == 0xa0 && In[sizeof(In) - 1] == 0xa0 + sizeof(In) - 1, "Received %02x..%02x\n", In[0],
+       In[sizeof(In) - 1]);
+    ok_int(SPIREG(0x04c), 0);
+    ok_int(SPIREG(0x034), sizeof(In));
+
+    SimEchoMosiCount = 0;
+    Status = AppleSpiTransfer(&Spi, 8000000, Out, In, 20);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(SimEchoMosiCount, 20);
+    ok(In[0] == (UCHAR)(0xa0 + sizeof(In)), "Full duplex received %02x\n", In[0]);
+
+    Status = AppleSpiTransfer(&Spi, 1, Out, NULL, 1);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(SPIREG(0x030), 0x7ff);
+
+    ok_hex(AppleSpiTransfer(&Spi, 8000000, Out, NULL, 0), STATUS_INVALID_PARAMETER);
+    ok_hex(AppleSpiTransfer(&Spi, 8000000, NULL, NULL, 4), STATUS_INVALID_PARAMETER);
+    ok_hex(AppleSpiTransfer(&Spi, 0, Out, NULL, 4), STATUS_INVALID_PARAMETER);
+
+    SimSpiStuck = TRUE;
+    Status = AppleSpiTransfer(&Spi, 8000000, Out, NULL, sizeof(Out));
+    ok_hex(Status, STATUS_IO_TIMEOUT);
+    ok_hex(SPIREG(0x000), 0);
+    SimSpiStuck = FALSE;
+
+    AppleSpiSetChipSelect(&Spi, FALSE);
+    ok_hex(SPIREG(0x00c), 2);
+    AppleSpiClose(&Spi);
+    ok(Spi.Registers == NULL, "The controller is still mapped\n");
+    ok_hex(AppleSpiTransfer(&Spi, 8000000, Out, NULL, 4), STATUS_INVALID_PARAMETER);
+    ok_int(SimMapCount, 0);
+}
+
+static
+VOID
+TestGpioInterrupt(VOID)
+{
+    FDT_DRIVER_TREE Tree;
+    APPLE_GPIO Gpio;
+    NTSTATUS Status;
+
+    ResetSpiSimulation(&Tree, FALSE);
+    Status = AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "test,button"), &Gpio);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(Gpio.Pin, 6);
+    ok(Gpio.ActiveLow, "A level-low interrupt is not active low\n");
+    PINCTRL(6 * 4) = 0x61;
+    AppleGpioConfigureInput(&Gpio);
+    ok_hex(PINCTRL(6 * 4), 0x20e);
+    ok(AppleGpioGet(&Gpio), "A low pin of an active-low line is not asserted\n");
+    PINCTRL(6 * 4) |= 1;
+    ok(!AppleGpioGet(&Gpio), "A high pin of an active-low line is asserted\n");
+    AppleGpioClose(&Gpio);
+    ok(!AppleGpioGet(&Gpio), "A closed pin is asserted\n");
+
+    ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "test,button-falling"), &Gpio), STATUS_SUCCESS);
+    ok(Gpio.ActiveLow && Gpio.Pin == 7, "A falling-edge interrupt on pin %lu is not active low\n", Gpio.Pin);
+    AppleGpioClose(&Gpio);
+    ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "test,button-high"), &Gpio), STATUS_SUCCESS);
+    ok(!Gpio.ActiveLow, "A level-high interrupt is active low\n");
+    PINCTRL(8 * 4) = 1;
+    ok(AppleGpioGet(&Gpio), "A high pin of an active-high line is not asserted\n");
+    AppleGpioClose(&Gpio);
+
+    ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "test,button-noirq"), &Gpio),
+           STATUS_DEVICE_CONFIGURATION_ERROR);
+    ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "test,button-beyond"), &Gpio),
+           STATUS_DEVICE_CONFIGURATION_ERROR);
+    ok_hex(AppleGpioOpenInterrupt(&Tree, FindNode(&Tree, "apple,spi"), &Gpio), STATUS_NOT_FOUND);
+    ok_int(SimMapCount, 0);
+}
+
+static
+VOID
 TestAcePd(VOID)
 {
     static const UCHAR PowerS5[] = { 5 }, Idle[4] = { 0 }, Event[8] = { 0x02, 0x02 }, Status[4] = { 0x61 };
@@ -4773,4 +5144,6 @@ START_TEST(AppleSoc)
     TestMca();
     TestMcaRx();
     TestAcePd();
+    TestSpi();
+    TestGpioInterrupt();
 }

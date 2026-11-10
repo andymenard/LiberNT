@@ -1,7 +1,7 @@
 /*
  * PROJECT:     LiberNT Apple RTKit Library
  * LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
- * PURPOSE:     Apple silicon pin controller: pin functions and GPIO outputs
+ * PURPOSE:     Apple silicon pin controller: pin functions, GPIO outputs and inputs
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
  */
 
@@ -31,6 +31,13 @@ AppleGpioOpen(
     _In_z_ PCSTR Property,
     _Out_ PAPPLE_GPIO Gpio);
 
+NTSTATUS
+NTAPI
+AppleGpioOpenInterrupt(
+    _In_ PFDT_DRIVER_TREE Tree,
+    _In_ ULONG Node,
+    _Out_ PAPPLE_GPIO Gpio);
+
 VOID
 NTAPI
 AppleGpioClose(
@@ -41,3 +48,13 @@ NTAPI
 AppleGpioSet(
     _In_ PAPPLE_GPIO Gpio,
     _In_ BOOLEAN Asserted);
+
+VOID
+NTAPI
+AppleGpioConfigureInput(
+    _In_ PAPPLE_GPIO Gpio);
+
+BOOLEAN
+NTAPI
+AppleGpioGet(
+    _In_ PAPPLE_GPIO Gpio);
