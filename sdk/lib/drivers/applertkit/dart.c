@@ -28,6 +28,25 @@
 #define DART_T8110_TTBR             0x1400
 #define DART_T8110_TTBR_VALID       0x1
 
+#define DART_T8020_STREAM_COMMAND   0x20
+#define DART_T8020_STREAM_COMMAND_BUSY 0x00000004
+#define DART_T8020_STREAM_COMMAND_INVALIDATE 0x00100000
+#define DART_T8020_STREAM_SELECT    0x34
+#define DART_T8020_CONFIG           0x60
+#define DART_T8020_CONFIG_LOCK      0x00008000
+#define DART_T8020_ENABLE_STREAMS   0xfc
+#define DART_T8020_TCR              0x100
+#define DART_T8020_TCR_TRANSLATE    0x00000080
+#define DART_T8020_TCR_BYPASS       0x00001100
+#define DART_T8020_TTBR             0x200
+#define DART_T8020_TTBR_VALID       0x80000000
+#define DART_T8020_TTBR_ADDRESS     0x7fffffff
+#define DART_T8020_TTBR_SHIFT       12
+#define DART_T8020_TTBR_COUNT       4
+#define DART_T8020_STREAMS          16
+#define DART_T8020_INPUT_BITS       32
+#define DART_T8020_OUTPUT_BITS      42
+
 #define DART_PAGE_SHIFT             14
 #define DART_PAGE_SIZE              (1ULL << DART_PAGE_SHIFT)
 #define DART_LEVEL_BITS             11
@@ -53,9 +72,32 @@ typedef struct _DART_IDENTITY
     ULONG64 TopPhysical;
 } DART_IDENTITY, *PDART_IDENTITY;
 
+typedef enum _DART_FAMILY
+{
+    DartFamilyNone,
+    DartFamilyT8110,
+    DartFamilyT6000
+} DART_FAMILY;
+
+typedef struct _DART_HW
+{
+    DART_FAMILY Family;
+    PUCHAR Base;
+    ULONG Size;
+    ULONG64 Physical;
+    ULONG Params2;
+    ULONG Params3;
+    ULONG Streams;
+    ULONG InputBits;
+    ULONG OutputBits;
+    BOOLEAN Locked;
+} DART_HW, *PDART_HW;
+
 static DART_IDENTITY AppleDartIdentity;
+static DART_IDENTITY AppleDartWindow32;
 static volatile LONG AppleDartIdentityBusy;
 static ULONG64 AppleDartLowNext = DART_LOW_WINDOW_BASE;
+static ULONG64 AppleDartLowNext32 = DART_LOW_WINDOW_BASE;
 
 static
 ULONG
@@ -74,6 +116,160 @@ AppleDartWrite(
     _In_ ULONG Value)
 {
     WRITE_REGISTER_ULONG((volatile ULONG *)(Base + Offset), Value);
+}
+
+static
+DART_FAMILY
+AppleDartFamily(
+    _In_ PFDT_DRIVER_TREE Tree,
+    _In_ ULONG Dart)
+{
+    const VOID *Compatible;
+    ULONG Length;
+
+    Compatible = FdtGetProperty(&Tree->Fdt, Dart, "compatible", &Length);
+    /* A node naming both takes the first: the t6000 layout. */
+    if (FdtStringListContains(Compatible, Length, "apple,t6000-dart"))
+        return DartFamilyT6000;
+    if (FdtStringListContains(Compatible, Length, "apple,t8110-dart"))
+        return DartFamilyT8110;
+    return DartFamilyNone;
+}
+
+static
+NTSTATUS
+AppleDartOpen(
+    _In_ PFDT_DRIVER_TREE Tree,
+    _In_ ULONG Dart,
+    _In_z_ PCSTR Owner,
+    _Out_ PDART_HW Hw)
+{
+    RtlZeroMemory(Hw, sizeof(*Hw));
+    Hw->Family = AppleDartFamily(Tree, Dart);
+    if (Hw->Family == DartFamilyNone)
+    {
+        DbgPrint("%s: DART %lx is neither a t8110 nor a t6000 DART\n", Owner, Dart);
+        return STATUS_NOT_SUPPORTED;
+    }
+    Hw->Base = FdtDriverMapReg(Tree, Dart, 0, &Hw->Physical, &Hw->Size);
+    if (!Hw->Base)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    Hw->Params2 = AppleDartRead(Hw->Base, DART_PARAMS2);
+    if (Hw->Family == DartFamilyT8110)
+    {
+        Hw->Params3 = AppleDartRead(Hw->Base, DART_T8110_PARAMS3);
+        Hw->Streams = AppleDartRead(Hw->Base, DART_T8110_PARAMS4) & 0x1ff;
+        Hw->InputBits = (Hw->Params3 >> 16) & 0x3f;
+        Hw->OutputBits = (Hw->Params3 >> 24) & 0x3f;
+        Hw->Locked = (AppleDartRead(Hw->Base, DART_T8110_PROTECT) & DART_T8110_PROTECT_TCR) != 0;
+    }
+    else
+    {
+        Hw->Streams = DART_T8020_STREAMS;
+        Hw->InputBits = DART_T8020_INPUT_BITS;
+        Hw->OutputBits = DART_T8020_OUTPUT_BITS;
+        Hw->Locked = (AppleDartRead(Hw->Base, DART_T8020_CONFIG) & DART_T8020_CONFIG_LOCK) != 0;
+    }
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
+AppleDartClose(
+    _Inout_ PDART_HW Hw)
+{
+    if (Hw->Base)
+        MmUnmapIoSpace(Hw->Base, Hw->Size);
+    Hw->Base = NULL;
+}
+
+static
+ULONG
+AppleDartTcrOffset(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Sid)
+{
+    return (Family == DartFamilyT6000 ? DART_T8020_TCR : DART_T8110_TCR) + 4 * Sid;
+}
+
+static
+ULONG
+AppleDartTtbrOffset(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Sid)
+{
+    return Family == DartFamilyT6000 ? DART_T8020_TTBR + 4 * DART_T8020_TTBR_COUNT * Sid : DART_T8110_TTBR + 4 * Sid;
+}
+
+static
+ULONG
+AppleDartTcrBypass(
+    _In_ DART_FAMILY Family)
+{
+    return Family == DartFamilyT6000 ? DART_T8020_TCR_BYPASS : DART_T8110_TCR_BYPASS;
+}
+
+static
+ULONG
+AppleDartTcrTranslate(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Levels)
+{
+    if (Family == DartFamilyT6000)
+        return DART_T8020_TCR_TRANSLATE;
+    return DART_T8110_TCR_TRANSLATE | (Levels == 3 ? DART_T8110_TCR_FOUR_LEVEL : 0);
+}
+
+static
+BOOLEAN
+AppleDartTcrTranslates(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Tcr)
+{
+    ULONG Bypass = AppleDartTcrBypass(Family);
+
+    if ((Tcr & Bypass) == Bypass)
+        return FALSE;
+    return (Tcr & (Family == DartFamilyT6000 ? DART_T8020_TCR_TRANSLATE : DART_T8110_TCR_TRANSLATE)) != 0;
+}
+
+static
+ULONG
+AppleDartTtbr(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG64 TablePhysical)
+{
+    if (Family == DartFamilyT6000)
+        return (ULONG)((TablePhysical >> DART_T8020_TTBR_SHIFT) & DART_T8020_TTBR_ADDRESS) | DART_T8020_TTBR_VALID;
+    return (ULONG)((TablePhysical >> DART_PAGE_SHIFT) << 2) | DART_T8110_TTBR_VALID;
+}
+
+static
+BOOLEAN
+AppleDartTtbrTable(
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Ttbr,
+    _Out_ PULONG64 TablePhysical)
+{
+    if (Family == DartFamilyT6000)
+    {
+        *TablePhysical = (ULONG64)(Ttbr & DART_T8020_TTBR_ADDRESS) << DART_T8020_TTBR_SHIFT;
+        return (Ttbr & DART_T8020_TTBR_VALID) != 0;
+    }
+    *TablePhysical = (ULONG64)(Ttbr >> 2) << DART_PAGE_SHIFT;
+    return (Ttbr & DART_T8110_TTBR_VALID) != 0;
+}
+
+static
+VOID
+AppleDartEnableStream(
+    _In_ PUCHAR Base,
+    _In_ DART_FAMILY Family,
+    _In_ ULONG Sid)
+{
+    ULONG Offset = Family == DartFamilyT6000 ? DART_T8020_ENABLE_STREAMS : DART_T8110_ENABLE_STREAMS + 4 * (Sid >> 5);
+
+    AppleDartWrite(Base, Offset, AppleDartRead(Base, Offset) | (1UL << (Sid & 31)));
 }
 
 static
@@ -245,70 +441,156 @@ static
 VOID
 AppleDartFlush(
     _In_ PUCHAR Base,
+    _In_ DART_FAMILY Family,
     _In_ ULONG Sid,
     _In_z_ PCSTR Owner)
 {
     ULONG Spin;
 
     KeMemoryBarrier();
-    AppleDartWrite(Base, DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_FLUSH | Sid);
-    for (Spin = 0; Spin < 1000 && (AppleDartRead(Base, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); ++Spin)
-        KeStallExecutionProcessor(1);
+    if (Family == DartFamilyT6000)
+    {
+        AppleDartWrite(Base, DART_T8020_STREAM_SELECT, 1UL << Sid);
+        AppleDartWrite(Base, DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_INVALIDATE);
+        for (Spin = 0; Spin < 1000 && (AppleDartRead(Base, DART_T8020_STREAM_COMMAND) & DART_T8020_STREAM_COMMAND_BUSY);
+             ++Spin)
+        {
+            KeStallExecutionProcessor(1);
+        }
+    }
+    else
+    {
+        AppleDartWrite(Base, DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_FLUSH | Sid);
+        for (Spin = 0; Spin < 1000 && (AppleDartRead(Base, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); ++Spin)
+            KeStallExecutionProcessor(1);
+    }
     if (Spin == 1000)
         DbgPrint("%s: DART TLB flush did not complete\n", Owner);
 }
 
 static
+NTSTATUS
+AppleDartBuildWindow(
+    _Inout_ PDART_IDENTITY Identity,
+    _In_ ULONG InputBits)
+{
+    ASSERT(InputBits <= DART_PAGE_SHIFT + 2 * DART_LEVEL_BITS);
+    Identity->InputBits = InputBits;
+    Identity->Levels = 2;
+    Identity->Top = AppleDartAllocateTable(FALSE, &Identity->TopPhysical);
+    if (!Identity->Top)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    if (Identity->TopPhysical >> (DART_T8020_TTBR_SHIFT + 31))
+    {
+        DbgPrint("DART: table at %I64x is beyond what a t6000 TTBR reaches\n", Identity->TopPhysical);
+        return STATUS_NOT_SUPPORTED;
+    }
+    return STATUS_SUCCESS;
+}
+
+static
+PDART_IDENTITY
+AppleDartTables(
+    _In_ DART_FAMILY Family)
+{
+    return Family == DartFamilyT6000 ? &AppleDartWindow32 : &AppleDartIdentity;
+}
+
+static
+NTSTATUS
+AppleDartPrepareTables(
+    _In_ PDART_HW Hw,
+    _In_z_ PCSTR Owner)
+{
+    PDART_IDENTITY Tables = AppleDartTables(Hw->Family);
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    ASSERT(AppleDartIdentityBusy == 1);
+    ASSERT(Hw->Family != DartFamilyNone);
+    if (!Tables->Top)
+    {
+        if (Hw->Family == DartFamilyT6000)
+            Status = AppleDartBuildWindow(Tables, Hw->InputBits);
+        else
+            Status = AppleDartBuildIdentity(Tables, Hw->InputBits, Hw->OutputBits);
+        DbgPrint("%s: DART %s tables for %lu-bit addresses, %lu levels: %lx\n", Owner,
+                 Hw->Family == DartFamilyT6000 ? "low window" : "identity", Hw->InputBits, Tables->Levels, Status);
+    }
+    else if (Tables->InputBits != Hw->InputBits)
+    {
+        Status = STATUS_NOT_SUPPORTED;
+    }
+    if (NT_SUCCESS(Status) && !Tables->Top)
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+    return Status;
+}
+
+static
 VOID
 AppleDartTranslateStream(
-    _In_ PUCHAR Base,
+    _In_ PDART_HW Hw,
     _In_ ULONG Sid,
     _In_z_ PCSTR Owner)
 {
-    ULONG Ttbr = (ULONG)((AppleDartIdentity.TopPhysical >> DART_PAGE_SHIFT) << 2) | DART_T8110_TTBR_VALID;
-    ULONG Tcr = DART_T8110_TCR_TRANSLATE | (AppleDartIdentity.Levels == 3 ? DART_T8110_TCR_FOUR_LEVEL : 0);
+    PDART_IDENTITY Tables = AppleDartTables(Hw->Family);
+    ULONG TcrOffset = AppleDartTcrOffset(Hw->Family, Sid), TtbrOffset = AppleDartTtbrOffset(Hw->Family, Sid);
+    ULONG Ttbr = AppleDartTtbr(Hw->Family, Tables->TopPhysical);
+    ULONG Tcr = AppleDartTcrTranslate(Hw->Family, Tables->Levels);
+    ULONG Index;
 
-    if (AppleDartRead(Base, DART_T8110_TCR + 4 * Sid) == Tcr && AppleDartRead(Base, DART_T8110_TTBR + 4 * Sid) == Ttbr)
+    ASSERT(Sid < Hw->Streams);
+    ASSERT(Tables->Top);
+    if (AppleDartRead(Hw->Base, TcrOffset) == Tcr && AppleDartRead(Hw->Base, TtbrOffset) == Ttbr)
     {
-        AppleDartFlush(Base, Sid, Owner);
+        AppleDartFlush(Hw->Base, Hw->Family, Sid, Owner);
         return;
     }
-    AppleDartWrite(Base, DART_T8110_TCR + 4 * Sid, 0);
-    AppleDartWrite(Base, DART_T8110_TTBR + 4 * Sid, Ttbr);
-    AppleDartWrite(Base, DART_T8110_ENABLE_STREAMS + 4 * (Sid >> 5),
-                   AppleDartRead(Base, DART_T8110_ENABLE_STREAMS + 4 * (Sid >> 5)) | (1UL << (Sid & 31)));
-    AppleDartFlush(Base, Sid, Owner);
-    AppleDartWrite(Base, DART_T8110_TCR + 4 * Sid, Tcr);
+    AppleDartWrite(Hw->Base, TcrOffset, 0);
+    AppleDartWrite(Hw->Base, TtbrOffset, Ttbr);
+    if (Hw->Family == DartFamilyT6000)
+    {
+        for (Index = 1; Index < DART_T8020_TTBR_COUNT; ++Index)
+            AppleDartWrite(Hw->Base, TtbrOffset + 4 * Index, 0);
+    }
+    AppleDartEnableStream(Hw->Base, Hw->Family, Sid);
+    AppleDartFlush(Hw->Base, Hw->Family, Sid, Owner);
+    AppleDartWrite(Hw->Base, TcrOffset, Tcr);
 }
 
 static
 NTSTATUS
 AppleDartIdentityStream(
-    _In_ PUCHAR Base,
+    _In_ PDART_HW Hw,
     _In_ ULONG Sid,
-    _In_ ULONG Params3,
     _In_z_ PCSTR Owner)
 {
-    ULONG InputBits = (Params3 >> 16) & 0x3f, OutputBits = (Params3 >> 24) & 0x3f;
-    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS Status;
 
     if (InterlockedCompareExchange(&AppleDartIdentityBusy, 1, 0) != 0)
         return STATUS_DEVICE_BUSY;
-    if (!AppleDartIdentity.Top)
-    {
-        Status = AppleDartBuildIdentity(&AppleDartIdentity, InputBits, OutputBits);
-        DbgPrint("%s: DART identity tables for %lu-bit addresses, %lu levels: %lx\n", Owner, InputBits,
-                 AppleDartIdentity.Levels, Status);
-    }
-    else if (AppleDartIdentity.InputBits != InputBits)
-    {
-        Status = STATUS_NOT_SUPPORTED;
-    }
+    Status = AppleDartPrepareTables(Hw, Owner);
     InterlockedExchange(&AppleDartIdentityBusy, 0);
-    if (!NT_SUCCESS(Status) || !AppleDartIdentity.Top)
-        return NT_SUCCESS(Status) ? STATUS_INSUFFICIENT_RESOURCES : Status;
-    AppleDartTranslateStream(Base, Sid, Owner);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    AppleDartTranslateStream(Hw, Sid, Owner);
     return STATUS_SUCCESS;
+}
+
+static
+VOID
+AppleDartBypassStream(
+    _In_ PDART_HW Hw,
+    _In_ ULONG Sid,
+    _In_z_ PCSTR Owner)
+{
+    ULONG TtbrOffset = AppleDartTtbrOffset(Hw->Family, Sid);
+    ULONG Index, Count = Hw->Family == DartFamilyT6000 ? DART_T8020_TTBR_COUNT : 1;
+
+    AppleDartWrite(Hw->Base, AppleDartTcrOffset(Hw->Family, Sid), AppleDartTcrBypass(Hw->Family));
+    for (Index = 0; Index < Count; ++Index)
+        AppleDartWrite(Hw->Base, TtbrOffset + 4 * Index, 0);
+    AppleDartEnableStream(Hw->Base, Hw->Family, Sid);
+    AppleDartFlush(Hw->Base, Hw->Family, Sid, Owner);
 }
 
 static
@@ -319,54 +601,46 @@ AppleDartPhysicalStream(
     _In_ ULONG Sid,
     _In_z_ PCSTR Owner)
 {
-    ULONG Length, Size, Params2, Params3, Streams, Protect;
-    const VOID *Compatible;
-    ULONG64 Physical;
-    PUCHAR Base;
-    NTSTATUS Status = STATUS_SUCCESS;
+    ULONG Bypass;
+    DART_HW Hw;
+    NTSTATUS Status;
 
-    Compatible = FdtGetProperty(&Tree->Fdt, Dart, "compatible", &Length);
-    if (!FdtStringListContains(Compatible, Length, "apple,t8110-dart"))
-    {
-        DbgPrint("%s: DART %lx is not a t8110 DART\n", Owner, Dart);
-        return STATUS_NOT_SUPPORTED;
-    }
-    Base = FdtDriverMapReg(Tree, Dart, 0, &Physical, &Size);
-    if (!Base)
-        return STATUS_INSUFFICIENT_RESOURCES;
-    Params2 = AppleDartRead(Base, DART_PARAMS2);
-    Params3 = AppleDartRead(Base, DART_T8110_PARAMS3);
-    Streams = AppleDartRead(Base, DART_T8110_PARAMS4) & 0x1ff;
-    Protect = AppleDartRead(Base, DART_T8110_PROTECT);
-    DbgPrint("%s: DART %I64x stream %lu: params %08lx %08lx %08lx, %lu streams, protect %08lx, tcr %08lx ttbr %08lx\n",
-             Owner, Physical, Sid, AppleDartRead(Base, DART_PARAMS1), Params2, Params3, Streams, Protect,
-             Sid < Streams ? AppleDartRead(Base, DART_T8110_TCR + 4 * Sid) : 0,
-             Sid < Streams ? AppleDartRead(Base, DART_T8110_TTBR + 4 * Sid) : 0);
-    if (Sid >= Streams)
+    Status = AppleDartOpen(Tree, Dart, Owner, &Hw);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Bypass = AppleDartTcrBypass(Hw.Family);
+    DbgPrint("%s: DART %I64x (%s) stream %lu: params %08lx %08lx %08lx, %lu streams, %slocked, tcr %08lx ttbr %08lx\n",
+             Owner, Hw.Physical, Hw.Family == DartFamilyT6000 ? "t6000" : "t8110", Sid,
+             AppleDartRead(Hw.Base, DART_PARAMS1), Hw.Params2, Hw.Params3, Hw.Streams, Hw.Locked ? "" : "not ",
+             Sid < Hw.Streams ? AppleDartRead(Hw.Base, AppleDartTcrOffset(Hw.Family, Sid)) : 0,
+             Sid < Hw.Streams ? AppleDartRead(Hw.Base, AppleDartTtbrOffset(Hw.Family, Sid)) : 0);
+    if (Sid >= Hw.Streams)
     {
         Status = STATUS_DEVICE_CONFIGURATION_ERROR;
     }
-    else if (Protect & DART_T8110_PROTECT_TCR)
+    else if (Hw.Locked)
     {
-        if ((AppleDartRead(Base, DART_T8110_TCR + 4 * Sid) & DART_T8110_TCR_BYPASS) != DART_T8110_TCR_BYPASS)
+        if ((AppleDartRead(Hw.Base, AppleDartTcrOffset(Hw.Family, Sid)) & Bypass) != Bypass)
         {
             DbgPrint("%s: DART stream %lu is locked by the firmware without bypass\n", Owner, Sid);
             Status = STATUS_ACCESS_DENIED;
         }
     }
-    else if (Params2 & DART_PARAMS2_BYPASS)
+    else if (Hw.Params2 & DART_PARAMS2_BYPASS)
     {
-        AppleDartWrite(Base, DART_T8110_TCR + 4 * Sid, DART_T8110_TCR_BYPASS);
-        AppleDartWrite(Base, DART_T8110_TTBR + 4 * Sid, 0);
-        AppleDartWrite(Base, DART_T8110_ENABLE_STREAMS + 4 * (Sid >> 5),
-                       AppleDartRead(Base, DART_T8110_ENABLE_STREAMS + 4 * (Sid >> 5)) | (1UL << (Sid & 31)));
-        AppleDartFlush(Base, Sid, Owner);
+        AppleDartBypassStream(&Hw, Sid, Owner);
+    }
+    else if (Hw.Family == DartFamilyT6000)
+    {
+        /* Memory starts at 1 TB, beyond 32-bit device addresses: such a stream takes low mappings only. */
+        DbgPrint("%s: DART stream %lu has no bypass and 32-bit device addresses; use low mappings\n", Owner, Sid);
+        Status = STATUS_NOT_SUPPORTED;
     }
     else
     {
-        Status = AppleDartIdentityStream(Base, Sid, Params3, Owner);
+        Status = AppleDartIdentityStream(&Hw, Sid, Owner);
     }
-    MmUnmapIoSpace(Base, Size);
+    AppleDartClose(&Hw);
     return Status;
 }
 
@@ -424,64 +698,53 @@ AppleDartMapLow(
     _Out_ PULONG64 Iova,
     _In_z_ PCSTR Owner)
 {
-    ULONG RegisterLength, Size, Params3, Streams, Cells, InputBits, OutputBits;
+    ULONG Cells;
     ULONG64 First, Last, Window, Page;
-    const VOID *Compatible;
-    PUCHAR Base;
-    NTSTATUS Status = STATUS_SUCCESS;
+    PULONG64 Next;
+    PDART_IDENTITY Tables;
+    DART_HW Hw;
+    NTSTATUS Status;
 
     *Iova = 0;
     if (Dart == FDT_NO_NODE || !Length || !FdtReadU32(&Tree->Fdt, Dart, "#iommu-cells", &Cells) || Cells != 1)
         return STATUS_INVALID_PARAMETER;
-    Compatible = FdtGetProperty(&Tree->Fdt, Dart, "compatible", &RegisterLength);
-    if (!FdtStringListContains(Compatible, RegisterLength, "apple,t8110-dart"))
+    if (AppleDartFamily(Tree, Dart) == DartFamilyNone)
         return STATUS_NOT_SUPPORTED;
-    Base = FdtDriverMapReg(Tree, Dart, 0, NULL, &Size);
-    if (!Base)
-        return STATUS_INSUFFICIENT_RESOURCES;
-    Params3 = AppleDartRead(Base, DART_T8110_PARAMS3);
-    Streams = AppleDartRead(Base, DART_T8110_PARAMS4) & 0x1ff;
-    InputBits = (Params3 >> 16) & 0x3f;
-    OutputBits = (Params3 >> 24) & 0x3f;
-    if (Sid >= Streams)
+    Status = AppleDartOpen(Tree, Dart, Owner, &Hw);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Sid >= Hw.Streams)
         Status = STATUS_INVALID_PARAMETER;
-    else if ((AppleDartRead(Base, DART_T8110_PROTECT) & DART_T8110_PROTECT_TCR))
+    else if (Hw.Locked)
         Status = STATUS_ACCESS_DENIED;
     else if (InterlockedCompareExchange(&AppleDartIdentityBusy, 1, 0) != 0)
         Status = STATUS_DEVICE_BUSY;
     if (!NT_SUCCESS(Status))
     {
         if (Status != STATUS_DEVICE_BUSY)
-            DbgPrint("%s: DART stream %lu of %lu cannot take a low mapping: %lx\n", Owner, Sid, Streams, Status);
-        MmUnmapIoSpace(Base, Size);
+            DbgPrint("%s: DART stream %lu of %lu cannot take a low mapping: %lx\n", Owner, Sid, Hw.Streams, Status);
+        AppleDartClose(&Hw);
         return Status;
     }
 
-    if (!AppleDartIdentity.Top)
-    {
-        Status = AppleDartBuildIdentity(&AppleDartIdentity, InputBits, OutputBits);
-        DbgPrint("%s: DART identity tables for %lu-bit addresses, %lu levels: %lx\n", Owner, InputBits,
-                 AppleDartIdentity.Levels, Status);
-    }
-    else if (AppleDartIdentity.InputBits != InputBits)
-    {
-        Status = STATUS_NOT_SUPPORTED;
-    }
+    Status = AppleDartPrepareTables(&Hw, Owner);
+    Tables = AppleDartTables(Hw.Family);
+    Next = Hw.Family == DartFamilyT6000 ? &AppleDartLowNext32 : &AppleDartLowNext;
     First = Physical & ~(DART_PAGE_SIZE - 1);
     Last = (Physical + Length + DART_PAGE_SIZE - 1) & ~(DART_PAGE_SIZE - 1);
-    Window = AppleDartLowNext;
+    Window = *Next;
     if (NT_SUCCESS(Status) && (Last <= First || Window + (Last - First) > DART_LOW_WINDOW_END))
         Status = STATUS_INSUFFICIENT_RESOURCES;
     for (Page = First; NT_SUCCESS(Status) && Page < Last; Page += DART_PAGE_SIZE)
-        Status = AppleDartMapPage(&AppleDartIdentity, Window + (Page - First), Page);
+        Status = AppleDartMapPage(Tables, Window + (Page - First), Page);
     if (NT_SUCCESS(Status))
-        AppleDartLowNext = Window + (Last - First);
+        *Next = Window + (Last - First);
     KeMemoryBarrier();
     InterlockedExchange(&AppleDartIdentityBusy, 0);
 
     if (NT_SUCCESS(Status))
     {
-        AppleDartTranslateStream(Base, Sid, Owner);
+        AppleDartTranslateStream(&Hw, Sid, Owner);
         *Iova = Window + (Physical - First);
         DbgPrint("%s: DART stream %lu maps %I64x+%Ix at device address %I64x\n", Owner, Sid, Physical, Length, *Iova);
     }
@@ -489,7 +752,7 @@ AppleDartMapLow(
     {
         DbgPrint("%s: DART stream %lu low mapping of %I64x+%Ix failed: %lx\n", Owner, Sid, Physical, Length, Status);
     }
-    MmUnmapIoSpace(Base, Size);
+    AppleDartClose(&Hw);
     return Status;
 }
 
@@ -503,30 +766,28 @@ AppleDartUnmapLow(
     _In_ SIZE_T Length,
     _In_z_ PCSTR Owner)
 {
-    ULONG RegisterLength, Size, Cells;
+    ULONG Cells;
     ULONG64 First, Last, Page;
-    const VOID *Compatible;
-    PUCHAR Base;
-    NTSTATUS Status = STATUS_SUCCESS;
+    DART_HW Hw;
+    NTSTATUS Status;
 
     if (Dart == FDT_NO_NODE || !Length || Iova < DART_LOW_WINDOW_BASE || Iova + Length < Iova ||
         Iova + Length > DART_LOW_WINDOW_END || !FdtReadU32(&Tree->Fdt, Dart, "#iommu-cells", &Cells) || Cells != 1)
     {
         return STATUS_INVALID_PARAMETER;
     }
-    Compatible = FdtGetProperty(&Tree->Fdt, Dart, "compatible", &RegisterLength);
-    if (!FdtStringListContains(Compatible, RegisterLength, "apple,t8110-dart"))
+    if (AppleDartFamily(Tree, Dart) == DartFamilyNone)
         return STATUS_NOT_SUPPORTED;
-    Base = FdtDriverMapReg(Tree, Dart, 0, NULL, &Size);
-    if (!Base)
-        return STATUS_INSUFFICIENT_RESOURCES;
-    if (Sid >= (AppleDartRead(Base, DART_T8110_PARAMS4) & 0x1ff))
+    Status = AppleDartOpen(Tree, Dart, Owner, &Hw);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Sid >= Hw.Streams)
         Status = STATUS_INVALID_PARAMETER;
     else if (InterlockedCompareExchange(&AppleDartIdentityBusy, 1, 0) != 0)
         Status = STATUS_DEVICE_BUSY;
     if (!NT_SUCCESS(Status))
     {
-        MmUnmapIoSpace(Base, Size);
+        AppleDartClose(&Hw);
         return Status;
     }
 
@@ -534,13 +795,13 @@ AppleDartUnmapLow(
     Last = (Iova + Length + DART_PAGE_SIZE - 1) & ~(DART_PAGE_SIZE - 1);
     for (Page = First; Page < Last; Page += DART_PAGE_SIZE)
     {
-        if (!AppleDartUnmapPage(&AppleDartIdentity, Page))
+        if (!AppleDartUnmapPage(AppleDartTables(Hw.Family), Page))
             Status = STATUS_NOT_FOUND;
     }
     KeMemoryBarrier();
     InterlockedExchange(&AppleDartIdentityBusy, 0);
-    AppleDartFlush(Base, Sid, Owner);
-    MmUnmapIoSpace(Base, Size);
+    AppleDartFlush(Hw.Base, Hw.Family, Sid, Owner);
+    AppleDartClose(&Hw);
     return Status;
 }
 
@@ -652,10 +913,10 @@ AppleDartAdopt(
     _In_z_ PCSTR Owner,
     _Out_ PAPPLE_DART_ADOPTED Adopted)
 {
-    ULONG Length, Size, Cells, Params3, Streams, Tcr, Ttbr;
-    const VOID *Compatible;
-    ULONG64 Physical;
-    PUCHAR Base;
+    ULONG Cells, Tcr, Ttbr;
+    ULONG64 Top;
+    DART_HW Hw;
+    NTSTATUS Status;
 
     RtlZeroMemory(Adopted, sizeof(*Adopted));
     if (Dart == FDT_NO_NODE || !FdtReadU32(&Tree->Fdt, Dart, "#iommu-cells", &Cells) || Cells != 1 ||
@@ -663,30 +924,31 @@ AppleDartAdopt(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    Compatible = FdtGetProperty(&Tree->Fdt, Dart, "compatible", &Length);
-    if (!FdtStringListContains(Compatible, Length, "apple,t8110-dart"))
+    if (AppleDartFamily(Tree, Dart) == DartFamilyNone)
         return STATUS_NOT_SUPPORTED;
-    Base = FdtDriverMapReg(Tree, Dart, 0, &Physical, &Size);
-    if (!Base)
-        return STATUS_INSUFFICIENT_RESOURCES;
-    Params3 = AppleDartRead(Base, DART_T8110_PARAMS3);
-    Streams = AppleDartRead(Base, DART_T8110_PARAMS4) & 0x1ff;
-    Tcr = Sid < Streams ? AppleDartRead(Base, DART_T8110_TCR + 4 * Sid) : 0;
-    Ttbr = Sid < Streams ? AppleDartRead(Base, DART_T8110_TTBR + 4 * Sid) : 0;
-    DbgPrint("%s: DART %I64x stream %lu of %lu left by the firmware: tcr %08lx ttbr %08lx params %08lx protect %08lx\n",
-             Owner, Physical, Sid, Streams, Tcr, Ttbr, Params3, AppleDartRead(Base, DART_T8110_PROTECT));
-    if (Sid >= Streams || !(Tcr & DART_T8110_TCR_TRANSLATE) ||
-        (Tcr & DART_T8110_TCR_BYPASS) == DART_T8110_TCR_BYPASS || !(Ttbr & DART_T8110_TTBR_VALID))
+    Status = AppleDartOpen(Tree, Dart, Owner, &Hw);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Tcr = Sid < Hw.Streams ? AppleDartRead(Hw.Base, AppleDartTcrOffset(Hw.Family, Sid)) : 0;
+    Ttbr = Sid < Hw.Streams ? AppleDartRead(Hw.Base, AppleDartTtbrOffset(Hw.Family, Sid)) : 0;
+    DbgPrint("%s: DART %I64x (%s) stream %lu of %lu left by the firmware: tcr %08lx ttbr %08lx params %08lx %slocked\n",
+             Owner, Hw.Physical, Hw.Family == DartFamilyT6000 ? "t6000" : "t8110", Sid, Hw.Streams, Tcr, Ttbr,
+             Hw.Params3, Hw.Locked ? "" : "not ");
+    if (Sid >= Hw.Streams || !AppleDartTcrTranslates(Hw.Family, Tcr) || !AppleDartTtbrTable(Hw.Family, Ttbr, &Top))
     {
-        MmUnmapIoSpace(Base, Size);
+        AppleDartClose(&Hw);
         return STATUS_DEVICE_NOT_READY;
     }
-    Adopted->Base = Base;
-    Adopted->BaseSize = Size;
+    Adopted->Base = Hw.Base;
+    Adopted->BaseSize = Hw.Size;
+    Adopted->Family = (ULONG)Hw.Family;
     Adopted->Sid = Sid;
-    Adopted->Levels = (Tcr & DART_T8110_TCR_FOUR_LEVEL) ? 3 : 2;
-    Adopted->InputBits = (Params3 >> 16) & 0x3f;
-    Adopted->TopPhysical = (ULONG64)(Ttbr >> 2) << DART_PAGE_SHIFT;
+    if (Hw.Family == DartFamilyT6000)
+        Adopted->Levels = 2;
+    else
+        Adopted->Levels = (Tcr & DART_T8110_TCR_FOUR_LEVEL) ? 3 : 2;
+    Adopted->InputBits = Hw.InputBits;
+    Adopted->TopPhysical = Top;
     Adopted->NextIova = WindowBase;
     Adopted->EndIova = WindowEnd;
     Adopted->Owner = Owner;
@@ -780,7 +1042,7 @@ AppleDartAdoptedMapAt(
             AppleDartEntry(First + Page) | DART_PTE_SUBPAGE_END | DART_PTE_VALID;
         AppleDartAdoptedTableDone(Table, Mapped);
     }
-    AppleDartFlush(Adopted->Base, Adopted->Sid, Adopted->Owner);
+    AppleDartFlush(Adopted->Base, (DART_FAMILY)Adopted->Family, Adopted->Sid, Adopted->Owner);
     DbgPrint("%s: DART stream %lu maps %I64x+%Ix at device address %I64x\n", Adopted->Owner, Adopted->Sid, Physical,
              Length, Iova + (Physical - First));
     return STATUS_SUCCESS;

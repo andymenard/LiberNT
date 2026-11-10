@@ -49,6 +49,7 @@ typedef struct _APPLE_DART_ADOPTED
 {
     PUCHAR Base;
     ULONG BaseSize;
+    ULONG Family;
     ULONG Sid;
     ULONG Levels;
     ULONG InputBits;

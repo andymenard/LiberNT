@@ -1025,6 +1025,8 @@ AcePdSleepMs(ULONG Milliseconds)
 #define PHANDLE_ANS         0x58
 #define PHANDLE_APCIE       0x82
 #define PHANDLE_DART0       0x8f
+
+static BOOLEAN SimDartT6000;
 #define PHANDLE_DART1       0x90
 #define PHANDLE_RTC_OFFSET  0x75
 #define PHANDLE_BOOT_ERRORS 0x73
@@ -1083,7 +1085,10 @@ BuildSocTree(VOID)
     FdtEndNode();
 
     FdtBeginNode("iommu@37a808000");
-    FdtStrings("compatible", LIST("apple,t6030-dart\0apple,t8110-dart"));
+    if (SimDartT6000)
+        FdtStrings("compatible", LIST("apple,t6000-dart"));
+    else
+        FdtStrings("compatible", LIST("apple,t6030-dart\0apple,t8110-dart"));
     FdtCells("reg", 4, 3, 0x7a808000, 0, 0x4000);
     FdtCells("#iommu-cells", 1, 1);
     FdtCells("phandle", 1, PHANDLE_DART0);
@@ -1699,6 +1704,101 @@ TestDartAdopt(VOID)
     ok_hex(Status, STATUS_SUCCESS);
     AppleDartAdoptedRelease(&Adopted);
     ok_int(SimMapCount, 0);
+}
+
+static
+VOID
+TestDartT6000(VOID)
+{
+    const ULONG64 Mapped = 0x00200000ULL, Phys = 0x10000040000ULL;
+    APPLE_DART_ADOPTED Adopted;
+    FDT_DRIVER_TREE Tree;
+    ULONG64 Top, Found, Iova;
+    ULONG Usb, Dart;
+    NTSTATUS Status;
+
+    SimDartT6000 = TRUE;
+
+    ResetSimulation(&Tree);
+    Usb = FindNode(&Tree, "apple,t8103-dwc3");
+    Dart = FindNode(&Tree, "apple,t6000-dart");
+    ok(Dart != FDT_NO_NODE, "The t6000 DART is missing from the tree\n");
+    DART(0x04) = 1;
+    DART(0x200) = 0x1234;
+    DART(0x210) = 0x5678;
+    Status = AppleDartMapPhysical(&Tree, Usb, "test");
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_hex(DART(0x100), 0x1100);
+    ok_hex(DART(0x104), 0x1100);
+    ok_hex(DART(0x200), 0);
+    ok_hex(DART(0x210), 0);
+    ok_hex(DART(0xfc), 3);
+    ok_hex(DART(0x34), 2);
+    ok_hex(DART(0x20), 0x100000);
+    ok_hex(DART(0x1000), 0);
+    ok_hex(DART(0xc00), 0);
+    ok_hex(DART(0x80), 0);
+    ok_int(SimMapCount, 0);
+
+    ResetSimulation(&Tree);
+    Status = AppleDartMapPhysical(&Tree, Usb, "test");
+    ok_hex(Status, STATUS_NOT_SUPPORTED);
+    ok_int(SimWriteCount, 0);
+
+    ResetSimulation(&Tree);
+    DART(0x60) = 0x8000;
+    DART(0x100) = DART(0x104) = 0x1100;
+    ok_hex(AppleDartMapPhysical(&Tree, Usb, "test"), STATUS_SUCCESS);
+    ok_int(SimWriteCount, 0);
+    DART(0x104) = 0x80;
+    ok_hex(AppleDartMapPhysical(&Tree, Usb, "test"), STATUS_ACCESS_DENIED);
+    ok_hex(AppleDartMapStream(&Tree, Dart, 16, "test"), STATUS_DEVICE_CONFIGURATION_ERROR);
+
+    ResetSimulation(&Tree);
+    memset(&AppleDartWindow32, 0, sizeof(AppleDartWindow32));
+    AppleDartLowNext32 = DART_LOW_WINDOW_BASE;
+    DART(0x214) = 0xdead;
+    Status = AppleDartMapLow(&Tree, Dart, 1, 0x10000006000ULL, 0x100, &Iova, "test");
+    ok_hex(Status, STATUS_SUCCESS);
+    ok(Iova == DART_LOW_WINDOW_BASE + 0x2000, "The low mapping is at %I64x\n", Iova);
+    ok_hex(DART(0x104), 0x80);
+    ok_hex(DART(0x210) & 0x80000000, 0x80000000);
+    ok_hex(DART(0x214), 0);
+    ok_hex(DART(0xfc), 2);
+    Top = (ULONG64)(DART(0x210) & 0x7fffffff) << 12;
+    ok(Top == AppleDartWindow32.TopPhysical, "TTBR points at %I64x, tables at %I64x\n", Top, AppleDartWindow32.TopPhysical);
+    ok(WalkDart(Top, 2, Iova & ~0x3fffULL) == 0x10000004000ULL, "The low page maps to %I64x\n",
+       WalkDart(Top, 2, Iova & ~0x3fffULL));
+    ok_hex(AppleDartUnmapLow(&Tree, Dart, 1, Iova, 0x100, "test"), STATUS_SUCCESS);
+    ok(WalkDart(Top, 2, Iova & ~0x3fffULL) == 0, "The unmapped page still maps\n");
+    ok_int(SimMapCount, 0);
+
+    ResetSimulation(&Tree);
+    Top = SimFirmwareTables(Mapped, Phys);
+    ok(Top != 0, "The firmware tables were not built\n");
+    DART(0x100 + 4 * DART_ADOPT_SID) = 0x80;
+    DART(0x200 + 16 * DART_ADOPT_SID) = (ULONG)(Top >> 12) | 0x80000000;
+    Status = AppleDartAdopt(&Tree, Dart, DART_ADOPT_SID, 0x10000000ULL, 0x20000000ULL, "test", &Adopted);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(Adopted.Levels, 2);
+    ok_int(Adopted.InputBits, 32);
+    ok(Adopted.TopPhysical == Top, "Adopted the tables at %I64x, not %I64x\n", Adopted.TopPhysical, Top);
+    ok(AppleDartAdoptedTranslate(&Adopted, Mapped, &Found) && Found == Phys,
+       "The firmware mapping resolves to %I64x\n", Found);
+    Status = AppleDartAdoptedMapAt(&Adopted, 0x10000000ULL, 0x10000080000ULL, 0x1000);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_hex(DART(0x34), 1UL << DART_ADOPT_SID);
+    ok_hex(DART(0x20), 0x100000);
+    ok_hex(DART(0x80), 0);
+    AppleDartAdoptedRelease(&Adopted);
+    ok_hex(AppleDartAdopt(&Tree, Dart, DART_ADOPT_SID, 0x10000000ULL, 0x200000000ULL, "test", &Adopted),
+           STATUS_NOT_SUPPORTED);
+    DART(0x100 + 4 * DART_ADOPT_SID) = 0x1180;
+    ok_hex(AppleDartAdopt(&Tree, Dart, DART_ADOPT_SID, 0x10000000ULL, 0x20000000ULL, "test", &Adopted),
+           STATUS_DEVICE_NOT_READY);
+    ok_int(SimMapCount, 0);
+
+    SimDartT6000 = FALSE;
 }
 
 static
@@ -4645,6 +4745,7 @@ START_TEST(AppleSoc)
     TestDartLowWindow();
     TestDartLowWindowM3Memory();
     TestDartAdopt();
+    TestDartT6000();
     TestPmpPower();
     TestUat();
     TestUatAdopt();
