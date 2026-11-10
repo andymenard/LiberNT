@@ -49,9 +49,12 @@ typedef struct _APPLE_PCIE_WINDOW
     BOOLEAN Prefetchable;
 } APPLE_PCIE_WINDOW, *PAPPLE_PCIE_WINDOW;
 
+typedef struct _PCIE_LAYOUT PCIE_LAYOUT;
+
 typedef struct _APPLE_PCIE
 {
     ULONG Node;
+    const PCIE_LAYOUT *Layout;
     ULONG FirstBus;
     ULONG LastBus;
     ULONG WindowCount;

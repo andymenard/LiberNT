@@ -1151,6 +1151,7 @@ AcePdSleepMs(ULONG Milliseconds)
 #define PHANDLE_DART0       0x8f
 
 static BOOLEAN SimDartT6000;
+static BOOLEAN SimPcieT6000;
 #define PHANDLE_DART1       0x90
 #define PHANDLE_RTC_OFFSET  0x75
 #define PHANDLE_BOOT_ERRORS 0x73
@@ -1254,11 +1255,17 @@ BuildSocTree(VOID)
     FdtEndNode();
 
     FdtBeginNode("pcie@580000000");
-    FdtStrings("compatible", LIST("apple,t6030-pcie\0apple,t6020-pcie"));
+    if (SimPcieT6000)
+        FdtStrings("compatible", LIST("apple,t6000-pcie\0apple,pcie"));
+    else
+        FdtStrings("compatible", LIST("apple,t6030-pcie\0apple,t6020-pcie"));
     FdtStrings("device_type", LIST("pci"));
     FdtCells("reg", 16, 5, 0x80000000, 0, 0x1000000, 5, 0x91000000, 0, 0x4000, 5, 0x94008000, 0, 0x4000,
              5, 0x9e020000, 0, 0x4000);
-    FdtStrings("reg-names", LIST("config\0rc\0port0\0phy0"));
+    if (SimPcieT6000)
+        FdtStrings("reg-names", LIST("config\0rc\0port0"));
+    else
+        FdtStrings("reg-names", LIST("config\0rc\0port0\0phy0"));
     FdtCells("msi-ranges", 5, 0x13, 0, 0x53e, 1, 0x20);
     FdtCells("bus-range", 2, 0, 4);
     FdtCells("ranges", 14, 0x43000000, 5, 0xa0000000, 5, 0xa0000000, 0, 0x20000000,
@@ -4131,6 +4138,71 @@ TestPcie(VOID)
     ok_int(SimMapCount, 0);
 }
 
+static
+VOID
+TestPcieT6000(VOID)
+{
+    FDT_DRIVER_TREE Tree;
+    APPLE_PCIE Pcie;
+    PAPPLE_PCIE_PORT Port;
+    ULONG Node, Index;
+    NTSTATUS Status;
+
+    SimPcieT6000 = TRUE;
+    ResetSimulation(&Tree);
+    Node = FindNode(&Tree, "apple,pcie");
+    Status = ApplePcieOpen(&Tree, Node, &Pcie);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok_int(Pcie.PortCount, 1);
+    Port = &Pcie.Ports[0];
+    ok(Port->Registers.Base != NULL && Port->Phy.Base == NULL, "Port window %p, PHY window %p\n",
+       Port->Registers.Base, Port->Phy.Base);
+
+    PCIEPORT(0x208) = 1;
+    SimWriteCount = 0;
+    Status = ApplePcieStartPort(&Tree, &Pcie, Port);
+    ok_hex(Status, STATUS_SUCCESS);
+    ok(Port->WasUp && Port->LinkUp, "Kept link state %u/%u\n", Port->WasUp, Port->LinkUp);
+    ok(SimWriteCount < RTL_NUMBER_OF(SimWrites), "The write log overflowed\n");
+    ok_hex(PCIEPORT(0x168), 0xfffff000);
+    ok_hex(PCIEPORT(0x124), 1);
+    ok_int(Port->Rid2SidEntries, 64);
+    ok(FindWrite(SIM_PCIE_PORT0_BASE + 0x814, 0, 0, 0) == MAXULONG, "PERST# was touched on a live link\n");
+    ok(FindWrite(SIM_PCIE_PORT0_BASE + 0x16c, 0, 0, 0) == MAXULONG &&
+       FindWrite(SIM_PCIE_PORT0_BASE + 0x170, 0, 0, 0) == MAXULONG, "The t6020 MSI address registers were written\n");
+    ok(FindWrite(SIM_PCIE_PORT0_BASE + 0x80, 0, 0, 0) == MAXULONG, "Link training restarted on a live link\n");
+    for (Index = 0; Index < SimWriteCount; ++Index)
+    {
+        if (SimWrites[Index].Physical >= SIM_PCIE_PORT0_BASE + 0x828 + 4 * 64 &&
+            SimWrites[Index].Physical < SIM_PCIE_PORT0_BASE + 0x4000)
+            break;
+    }
+    ok(Index == SimWriteCount, "A write went past the RID2SID table to %I64x\n",
+       Index < SimWriteCount ? SimWrites[Index].Physical : 0);
+
+    PCIECFG(0x0000) = 0x443314e4;
+    PCIECFG(0x1000) = 0x5f7114e4;
+    PCIECFG(0x2000) = 0xffffffff;
+    DART(0x04) = 1;
+    DART(0x0c) = 16;
+    ok_int(ApplePcieMapPortDevices(&Tree, &Pcie, Port), 2);
+    ok_int(Port->Rid2SidUsed, 2);
+    ok_hex(PCIEPORT(0x828), 0x80010100);
+    ok_hex(PCIEPORT(0x82c), 0x80010101);
+    ok_hex(PCIEPORT(0x3000), 0);
+
+    PCIEPORT(0x208) = 0;
+    SimWriteCount = 0;
+    Status = ApplePcieStartPort(&Tree, &Pcie, Port);
+    ok_hex(Status, STATUS_NOT_SUPPORTED);
+    ok(!Port->WasUp && !Port->LinkUp, "Link state %u/%u\n", Port->WasUp, Port->LinkUp);
+    ok(FindWrite(SIM_PCIE_PORT0_BASE + 0x814, 0, 0, 0) == MAXULONG, "PERST# was touched without a PHY window\n");
+
+    ApplePcieClose(&Pcie);
+    ok_int(SimMapCount, 0);
+    SimPcieT6000 = FALSE;
+}
+
 #define PHANDLE_AIC         0x13
 #define PHANDLE_CLKREF      0x14
 #define PHANDLE_I2C_PINS    0x18
@@ -5537,6 +5609,7 @@ START_TEST(AppleSoc)
     TestSpmi();
     TestAtcphy();
     TestPcie();
+    TestPcieT6000();
     TestGpio();
     TestI2c();
     TestNco();

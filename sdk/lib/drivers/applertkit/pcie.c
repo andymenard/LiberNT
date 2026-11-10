@@ -26,8 +26,6 @@
 #define PORT_INTMSK                 0x0104
 #define PORT_MSICFG                 0x0124
 #define PORT_MSICFG_EN              (1UL << 0)
-#define PORT_MSIADDR                0x016C
-#define PORT_MSIADDR_HI             0x0170
 #define PORT_LINKSTS                0x0208
 #define PORT_LINKSTS_UP             (1UL << 0)
 #define PORT_LINKCMDSTS             0x0210
@@ -36,17 +34,64 @@
 #define PORT_APPCLK_CGDIS           (1UL << 8)
 #define PORT_STATUS                 0x0804
 #define PORT_STATUS_READY           (1UL << 0)
-#define PORT_PERST                  0x082C
 #define PORT_PERST_OFF              (1UL << 0)
-#define PORT_RID2SID                0x3000
-#define PORT_RID2SID_MAX            512
-#define PORT_MSIMAP                 0x3800
 #define PORT_MSIMAP_ENABLE          (1UL << 31)
-#define PORT_SPAN                   (PORT_MSIMAP + 4 * 32)
 #define PORT_RID2SID_PROBE          0xBAD1DUL
 #define PORT_RID2SID_VALID          (1UL << 31)
 
 #define PCIE_MAX_MSI_VECTORS        32
+
+typedef struct _PCIE_LAYOUT
+{
+    PCSTR Compatible;
+    ULONG Perst;
+    ULONG MsiAddress;
+    ULONG MsiAddressHigh;
+    ULONG MsiMap;
+    ULONG Rid2Sid;
+    ULONG Rid2SidMax;
+} PCIE_LAYOUT, *PPCIE_LAYOUT;
+
+static const PCIE_LAYOUT PcieLayouts[] =
+{
+    { "apple,t6020-pcie", 0x082C, 0x016C, 0x0170, 0x3800, 0x3000, 512 },
+    { "apple,pcie", 0x0814, 0x0168, 0, 0, 0x0828, 64 },
+};
+
+static
+ULONG
+PcieLayoutSpan(
+    _In_ const PCIE_LAYOUT *Layout)
+{
+    ULONG Span = Layout->Rid2Sid + 4 * Layout->Rid2SidMax;
+
+    if (Layout->MsiMap)
+        Span = max(Span, Layout->MsiMap + 4 * PCIE_MAX_MSI_VECTORS);
+    return Span;
+}
+
+static
+const PCIE_LAYOUT *
+PcieFindLayout(
+    _In_ PFDT_DRIVER_TREE Tree,
+    _In_ ULONG Node)
+{
+    const VOID *Compatible;
+    const CHAR *Entry;
+    ULONG Length, Cursor = 0, EntryLength, Index;
+
+    Compatible = FdtGetProperty(&Tree->Fdt, Node, "compatible", &Length);
+    while ((Entry = FdtNextString(Compatible, Length, &Cursor, &EntryLength)) != NULL)
+    {
+        for (Index = 0; Index < RTL_NUMBER_OF(PcieLayouts); ++Index)
+        {
+            if (EntryLength == strlen(PcieLayouts[Index].Compatible) &&
+                !memcmp(Entry, PcieLayouts[Index].Compatible, EntryLength))
+                return &PcieLayouts[Index];
+        }
+    }
+    return NULL;
+}
 
 #define PIN_DATA                    (1UL << 0)
 #define PIN_MODE                    (7UL << 1)
@@ -270,6 +315,11 @@ PcieBringUpLink(
         ResetController != Pcie->PinctrlNode || !Pcie->Pinctrl.Base ||
         (ResetPin + 1) * sizeof(ULONG) > Pcie->Pinctrl.Size)
         return STATUS_DEVICE_CONFIGURATION_ERROR;
+    if (!Port->Phy.Base)
+    {
+        DbgPrint("applepcie: port %lu has no PHY window, so a link the firmware left down stays down\n", Port->Index);
+        return STATUS_NOT_SUPPORTED;
+    }
     Pwren = PcieReadGpio(Tree, Port->Node, "pwren-gpios", &PwrenController, &PwrenPin, &PwrenActiveLow);
 
     PcieMask(&Port->Registers, PORT_APPCLK, 0, PORT_APPCLK_EN);
@@ -297,7 +347,7 @@ PcieBringUpLink(
     PcieMask(&Port->Phy, PHY_LANE_CFG, 0, PHY_LANE_CFG_REFCLKEN);
     PcieSleepMs(Pwren ? PCIE_TPVPERL_MS : PCIE_TPERST_CLK_MS);
 
-    PcieMask(&Port->Registers, PORT_PERST, 0, PORT_PERST_OFF);
+    PcieMask(&Port->Registers, Pcie->Layout->Perst, 0, PORT_PERST_OFF);
     PcieSetResetPin(Pcie, ResetPin, ResetActiveLow, FALSE);
     PcieSleepMs(PCIE_PERST_SETTLE_MS);
     for (Waited = 0; !(PcieRead(&Port->Registers, PORT_STATUS) & PORT_STATUS_READY); ++Waited)
@@ -327,6 +377,9 @@ ApplePcieOpen(
     RtlZeroMemory(Pcie, sizeof(*Pcie));
     Pcie->Node = Node;
     Pcie->PinctrlNode = FDT_NO_NODE;
+    Pcie->Layout = PcieFindLayout(Tree, Node);
+    if (!Pcie->Layout)
+        return STATUS_NOT_SUPPORTED;
     Status = ApplePmgrPowerOnDevice(Tree, Node);
     if (!NT_SUCCESS(Status))
         return Status;
@@ -380,7 +433,9 @@ ApplePcieOpen(
             continue;
         PortName[4] = (CHAR)('0' + Port->Index);
         PhyName[3] = (CHAR)('0' + Port->Index);
-        if (!PcieMapNamed(Tree, Node, PortName, PORT_SPAN, &Port->Registers) ||
+        if (!PcieMapNamed(Tree, Node, PortName, PcieLayoutSpan(Pcie->Layout), &Port->Registers))
+            continue;
+        if (FdtDriverFindRegIndex(Tree, Node, PhyName) != MAXULONG &&
             !PcieMapNamed(Tree, Node, PhyName, sizeof(ULONG), &Port->Phy))
         {
             PcieUnmap(&Port->Registers);
@@ -423,9 +478,13 @@ ApplePcieStartPort(
     _Inout_ PAPPLE_PCIE Pcie,
     _Inout_ PAPPLE_PCIE_PORT Port)
 {
+    const PCIE_LAYOUT *Layout = Pcie->Layout;
     ULONG Index, Waited;
     NTSTATUS Status;
 
+    ASSERT(Layout);
+    Port->LinkUp = FALSE;
+    Port->LinkWaitMs = 0;
     Port->WasUp = (PcieRead(&Port->Registers, PORT_LINKSTS) & PORT_LINKSTS_UP) != 0;
     if (!Port->WasUp)
     {
@@ -433,24 +492,26 @@ ApplePcieStartPort(
         if (!NT_SUCCESS(Status))
             return Status;
     }
-    PcieMask(&Port->Phy, PHY_LANE_CFG, 0, PHY_LANE_CFG_REFCLKCGEN);
+    if (Port->Phy.Base)
+        PcieMask(&Port->Phy, PHY_LANE_CFG, 0, PHY_LANE_CFG_REFCLKCGEN);
     PcieMask(&Port->Registers, PORT_APPCLK, PORT_APPCLK_CGDIS, 0);
 
     PcieWrite(&Port->Registers, PORT_INTMSK, MAXULONG);
     PcieWrite(&Port->Registers, PORT_INTSTAT, MAXULONG);
     PcieWrite(&Port->Registers, PORT_LINKCMDSTS, MAXULONG);
-    PcieWrite(&Port->Registers, PORT_MSIADDR, APPLE_PCIE_MSI_DOORBELL);
-    PcieWrite(&Port->Registers, PORT_MSIADDR_HI, 0);
-    for (Index = 0; Index < Pcie->MsiVectors; ++Index)
-        PcieWrite(&Port->Registers, PORT_MSIMAP + 4 * Index, Index | PORT_MSIMAP_ENABLE);
+    PcieWrite(&Port->Registers, Layout->MsiAddress, APPLE_PCIE_MSI_DOORBELL);
+    if (Layout->MsiAddressHigh)
+        PcieWrite(&Port->Registers, Layout->MsiAddressHigh, 0);
+    for (Index = 0; Layout->MsiMap && Index < Pcie->MsiVectors; ++Index)
+        PcieWrite(&Port->Registers, Layout->MsiMap + 4 * Index, Index | PORT_MSIMAP_ENABLE);
     PcieMask(&Port->Registers, PORT_MSICFG, 0, PORT_MSICFG_EN);
 
-    for (Index = 0; Index < PORT_RID2SID_MAX && PORT_RID2SID + 4 * (Index + 1) <= Port->Registers.Size; ++Index)
+    for (Index = 0; Index < Layout->Rid2SidMax && Layout->Rid2Sid + 4 * (Index + 1) <= Port->Registers.Size; ++Index)
     {
-        PcieWrite(&Port->Registers, PORT_RID2SID + 4 * Index, PORT_RID2SID_PROBE);
-        if (PcieRead(&Port->Registers, PORT_RID2SID + 4 * Index) != PORT_RID2SID_PROBE)
+        PcieWrite(&Port->Registers, Layout->Rid2Sid + 4 * Index, PORT_RID2SID_PROBE);
+        if (PcieRead(&Port->Registers, Layout->Rid2Sid + 4 * Index) != PORT_RID2SID_PROBE)
             break;
-        PcieWrite(&Port->Registers, PORT_RID2SID + 4 * Index, 0);
+        PcieWrite(&Port->Registers, Layout->Rid2Sid + 4 * Index, 0);
     }
     Port->Rid2SidEntries = Index;
     Port->Rid2SidUsed = 0;
@@ -523,7 +584,8 @@ ApplePcieMapPortDevices(
         Rid = (Port->Bus << 8) | Function;
         if (!ApplePcieFindStream(Tree, Pcie->Node, Rid, &Phandle, &Sid) || Port->Rid2SidUsed >= Port->Rid2SidEntries)
             continue;
-        PcieWrite(&Port->Registers, PORT_RID2SID + 4 * Port->Rid2SidUsed, PORT_RID2SID_VALID | (Sid << 16) | Rid);
+        ASSERT(Port->Rid2SidUsed < Pcie->Layout->Rid2SidMax);
+        PcieWrite(&Port->Registers, Pcie->Layout->Rid2Sid + 4 * Port->Rid2SidUsed, PORT_RID2SID_VALID | (Sid << 16) | Rid);
         Port->Rid2SidUsed++;
         for (Index = 0; Index < MappedCount && (MappedDart[Index] != Phandle || MappedSid[Index] != Sid); ++Index)
             ;

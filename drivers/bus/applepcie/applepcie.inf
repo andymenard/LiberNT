@@ -17,6 +17,7 @@ DefaultDestDir = 12
 
 [StdMfg]
 %ApplePcie.DeviceDesc% = ApplePcie_Inst,FDT\apple_t6020-pcie
+%ApplePcie.DeviceDesc% = ApplePcie_Inst,FDT\apple_pcie
 
 [ApplePcie_Inst.NT]
 CopyFiles = ApplePcie_CopyFiles
