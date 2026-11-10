@@ -27,6 +27,7 @@ DefaultDestDir = 12
 [STORNVME]
 %NVME.DeviceDesc% = stornvme_Inst, PCI\CC_010802
 %ANS.DeviceDesc% = stornvme_Inst, FDT\apple_t8103-nvme-ans2
+%ANS.DeviceDesc% = stornvme_Inst, FDT\apple_nvme-ans2
 
 [ControlFlags]
 ExcludeFromSelect = *

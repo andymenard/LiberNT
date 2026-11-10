@@ -17,6 +17,7 @@ DefaultDestDir = 12
 
 [StdMfg]
 %AppleSmc.DeviceDesc% = AppleSmc_Inst,FDT\apple_t8103-smc
+%AppleSmc.DeviceDesc% = AppleSmc_Inst,FDT\apple_smc
 %PowerButton.DeviceDesc% = AppleSmc_Raw_Inst,APPLESMC\POWERBUTTON
 %Lid.DeviceDesc% = AppleSmc_Raw_Inst,APPLESMC\LID
 
