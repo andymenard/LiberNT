@@ -803,7 +803,31 @@ Returns:
     //
     // Complete the NT IRP through the frameworks FxIrp
     //
+#if (FX_CORE_MODE == FX_CORE_KERNEL_MODE)
+    PDEVICE_OBJECT deviceObject = IoGetCurrentIrpStackLocation(pIrp)->DeviceObject;
+    if (deviceObject != NULL && deviceObject->DeviceType == FILE_DEVICE_SERIAL_PORT &&
+        irp.GetMajorFunction() == IRP_MJ_READ && Status == STATUS_CANCELLED &&
+        pIrp->Cancel && irp.GetInformation() != 0 &&
+        irp.GetInformation() <= IoGetCurrentIrpStackLocation(pIrp)->Parameters.Read.Length)
+    {
+        Status = STATUS_SUCCESS;
+    }
+#endif
     irp.SetStatus(Status);
+
+#if (FX_CORE_MODE == FX_CORE_KERNEL_MODE)
+    if (deviceObject != NULL && deviceObject->DeviceType == FILE_DEVICE_SERIAL_PORT &&
+        (irp.GetMajorFunction() == IRP_MJ_READ || irp.GetMajorFunction() == IRP_MJ_WRITE))
+    {
+        static LONG serialCompletions;
+        if (InterlockedIncrement(&serialCompletions) <= 80)
+        {
+            DbgPrint("wdf serial diag: request %p %s final status 0x%08lx, %Iu bytes, cancel %u\n",
+                     GetObjectHandle(), irp.GetMajorFunction() == IRP_MJ_READ ? "rx" : "tx",
+                     Status, irp.GetInformation(), pIrp->Cancel);
+        }
+    }
+#endif
 
     ASSERT(IsCancelRoutineSet() == FALSE);
 
