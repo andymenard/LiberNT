@@ -2719,7 +2719,11 @@ USBH_PdoQueryDeviceText(IN PUSBHUB_PORT_PDO_EXTENSION PortExtension,
 
     if (DeviceTextType == DeviceTextLocationInformation)
     {
-        ASSERT(PortExtension->HubExtension);
+        /* USBH_PdoRemoveDevice clears HubExtension, but PnP can still query
+         * the text of a surprise-removed PDO before it is deleted. */
+        if (!PortExtension->HubExtension)
+            return STATUS_NO_SUCH_DEVICE;
+
         ASSERT(PortExtension->HubExtension->HubNumber != 0);
 
         Length = 32 * sizeof(WCHAR);
