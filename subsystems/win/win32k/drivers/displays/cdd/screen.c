@@ -180,6 +180,7 @@ RcddInitScreenInfo(
    ppdev->ModeIndex = SelectedMode->ModeIndex;
    ppdev->ScreenWidth = SelectedMode->VisScreenWidth;
    ppdev->ScreenHeight = SelectedMode->VisScreenHeight;
+   ppdev->ScreenRefresh = SelectedMode->Frequency;
    ppdev->ScreenDelta = SelectedMode->ScreenStride;
    ppdev->BitsPerPixel = (UCHAR)(SelectedMode->BitsPerPlane * SelectedMode->NumberOfPlanes);
 
@@ -442,6 +443,38 @@ RcddRefreshModeIndex(
    return Found;
 }
 
+BOOL
+RcddCommitMode(PRCDD_PDEV ppdev, BOOL ReuseCurrent)
+{
+   VIDEO_MODE_INFORMATION CurrentMode;
+   ULONG BytesReturned;
+
+   if (ReuseCurrent &&
+       !EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_QUERY_CURRENT_MODE,
+                           NULL, 0, &CurrentMode, sizeof(CurrentMode), &BytesReturned) &&
+       BytesReturned >= sizeof(CurrentMode) &&
+       CurrentMode.VisScreenWidth == ppdev->ScreenWidth &&
+       CurrentMode.VisScreenHeight == ppdev->ScreenHeight &&
+       CurrentMode.BitsPerPlane * CurrentMode.NumberOfPlanes == ppdev->BitsPerPixel &&
+       CurrentMode.Frequency == ppdev->ScreenRefresh &&
+       CurrentMode.RedMask == ppdev->RedMask &&
+       CurrentMode.GreenMask == ppdev->GreenMask &&
+       CurrentMode.BlueMask == ppdev->BlueMask)
+   {
+      return TRUE;
+   }
+
+   if (!EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_SET_CURRENT_MODE,
+                           &ppdev->ModeIndex, sizeof(ppdev->ModeIndex), NULL, 0,
+                           &BytesReturned))
+      return TRUE;
+
+   return RcddRefreshModeIndex(ppdev) &&
+          !EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_SET_CURRENT_MODE,
+                              &ppdev->ModeIndex, sizeof(ppdev->ModeIndex), NULL, 0,
+                              &BytesReturned);
+}
+
 /*
  * RcddAssertMode
  *
@@ -459,16 +492,8 @@ RcddAssertMode(
 
    if (bEnable)
    {
-      if (EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_SET_CURRENT_MODE,
-                             &(ppdev->ModeIndex), sizeof(ULONG), NULL, 0,
-                             &ulTemp) &&
-          (!RcddRefreshModeIndex(ppdev) ||
-           EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_SET_CURRENT_MODE,
-                              &(ppdev->ModeIndex), sizeof(ULONG), NULL, 0,
-                              &ulTemp)))
-      {
+      if (!RcddCommitMode(ppdev, FALSE))
          return FALSE;
-      }
       if (ppdev->BitsPerPixel == 8)
       {
          RcddSetPaletteEntries(dhpdev, ppdev->PaletteEntries, 0, 256);

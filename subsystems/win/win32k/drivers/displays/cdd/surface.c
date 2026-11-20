@@ -57,12 +57,8 @@ RcddEnableSurface(
    RtlZeroMemory(&VideoMemoryInfo, sizeof(VideoMemoryInfo));
 
    /* Commit the requested mode on the WDDM display device. */
-   if (EngDeviceIoControl(ppdev->hDriver, IOCTL_VIDEO_SET_CURRENT_MODE,
-                          &(ppdev->ModeIndex), sizeof(ULONG), NULL, 0,
-                          &ulTemp))
-   {
+   if (!RcddCommitMode(ppdev, TRUE))
       return NULL;
-   }
 
    /*
     * Map the DOD primary (dxgkrnl's system-memory scan-out surface) into our

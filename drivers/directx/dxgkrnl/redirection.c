@@ -329,6 +329,8 @@ static VOID
 DxgkpRefreshCompositionNow(VOID)
 {
     PDXGKENG_REFRESH_COMPOSITION Callback;
+    KAPC_STATE ApcState;
+    PEPROCESS SessionProcess;
 
     KeEnterCriticalRegion();
     ExfAcquirePushLockShared(&DxgkpWin32kCddInterfaceLock);
@@ -336,8 +338,11 @@ DxgkpRefreshCompositionNow(VOID)
     ExfReleasePushLockShared(&DxgkpWin32kCddInterfaceLock);
     KeLeaveCriticalRegion();
 
-    if (Callback != NULL)
+    if (Callback != NULL && DxgkDisplayAttachWin32kSession(&ApcState, &SessionProcess))
+    {
         Callback();
+        DxgkDisplayDetachWin32kSession(&ApcState, SessionProcess);
+    }
 }
 
 static VOID

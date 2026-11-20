@@ -1497,7 +1497,12 @@ UserRedrawDesktop(VOID)
     PREGION Rgn;
 
     Window = UserGetDesktopWindow();
+    if (Window == NULL)
+        return;
+
     Rgn = IntSysCreateRectpRgnIndirect(&Window->rcWindow);
+    if (Rgn == NULL)
+        return;
 
     IntInvalidateWindows(Window,
                          Rgn,

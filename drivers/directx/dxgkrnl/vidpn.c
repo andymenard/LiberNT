@@ -1830,6 +1830,11 @@ DxgkpBindVidPnTargetsToCachedChildren(
     ExFreePoolWithTag(Uids, TAG_DXGK_VIDPN);
 }
 
+static NTSTATUS
+DxgkpPrepareInitialConnectedTopology(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _Inout_ PDXGKP_VIDPN VidPn);
+
 NTSTATUS
 DxgkVidPnCreateForAdapter(
     _In_  PDXGKRNL_ADAPTER  Adapter,
@@ -1950,6 +1955,15 @@ DxgkVidPnCreateForAdapter(
             VidPn->MonitorModeSets[i]);
     }
     VidPn->NumPaths = PathCount;
+    if (!SeedDefaultTopology && Adapter->HotPlugDetectEnabled)
+    {
+        Status = DxgkpPrepareInitialConnectedTopology(Adapter, VidPn);
+        if (!NT_SUCCESS(Status))
+        {
+            DxgkVidPnDestroy((D3DKMDT_HVIDPN)VidPn);
+            return Status;
+        }
+    }
 
     *phVidPn = (D3DKMDT_HVIDPN)VidPn;
 
@@ -2647,6 +2661,8 @@ DxgkpSetLinkConfiguring(
     InterlockedIncrement(&Adapter->LinkConfigGeneration);
 }
 
+#define DXGKP_INHERITED_DISCONNECT_GRACE_MS 3000
+
 static VOID
 DxgkpDrainConnectionChanges(
     _In_ PDXGKRNL_ADAPTER Adapter)
@@ -2775,6 +2791,32 @@ DxgkpDrainConnectionChanges(
                              (UINT)Args.ConnectionChange.ConnectionStatus);
                 continue;
         }
+        if (Args.ConnectionChange.TargetId == Adapter->FirmwareTargetId)
+        {
+            if (Args.ConnectionChange.ConnectionStatus == MonitorStatusConnected)
+            {
+                InterlockedExchange64(&Adapter->InheritedHandoffTime, 0);
+                if (InterlockedExchange64(&Adapter->InheritedDisconnectDeadline, 0) != 0)
+                    DXGKRNL_INFO("CONNECTOR_CHANGE: inherited target %u reconnected during startup\n",
+                                 (UINT)Args.ConnectionChange.TargetId);
+            }
+            else
+            {
+                LONG64 HandoffTime = InterlockedExchange64(&Adapter->InheritedHandoffTime, 0);
+                ULONGLONG Now = KeQueryInterruptTime();
+                ULONGLONG Grace = DXGKP_INHERITED_DISCONNECT_GRACE_MS * 10000ULL;
+
+                if (HandoffTime != 0 && Now - (ULONGLONG)HandoffTime < Grace)
+                {
+                    InterlockedExchange64(&Adapter->InheritedDisconnectDeadline,
+                                          (ULONGLONG)HandoffTime + Grace);
+                    DXGKRNL_INFO("CONNECTOR_CHANGE: waiting for inherited target %u to settle\n",
+                                 (UINT)Args.ConnectionChange.TargetId);
+                }
+                if (InterlockedCompareExchange64(&Adapter->InheritedDisconnectDeadline, 0, 0) != 0)
+                    continue;
+            }
+        }
         if (NT_SUCCESS(DxgkPnpIndicateChildConnection(Adapter,
                                                       Args.ConnectionChange.TargetId,
                                                       Args.ConnectionChange.ConnectionStatus == MonitorStatusConnected,
@@ -2804,6 +2846,71 @@ DxgkpDrainConnectionChanges(
         IoInvalidateDeviceRelations(Adapter->PhysicalDeviceObject, BusRelations);
 }
 
+VOID
+DxgkVidPnDrainInitialConnectionChanges(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    PAGED_CODE();
+
+    if (InterlockedExchange(&Adapter->ConnectorChangePending, 0) != 0)
+        DxgkpDrainConnectionChanges(Adapter);
+    else if (DXGK_CB_FULL(Adapter, DxgkDdiQueryConnectionChange) != NULL)
+        DXGKRNL_INFO("CONNECTOR_CHANGE: adapter %p has no notification before initial topology\n",
+                     Adapter);
+}
+
+BOOLEAN
+DxgkVidPnAllActiveTargetsDisconnected(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    PDXGKP_VIDPN VidPn;
+    BOOLEAN Disconnected = FALSE;
+    KIRQL OldIrql;
+    SIZE_T Index;
+
+    PAGED_CODE();
+
+    (VOID)KeWaitForSingleObject(&Adapter->VidPnMutex, Executive, KernelMode, FALSE, NULL);
+    VidPn = Adapter->VidPn;
+    if (VidPn != NULL && VidPn->NumPaths != 0)
+    {
+        KeAcquireSpinLock(&Adapter->ChildListLock, &OldIrql);
+        for (Index = 0; Index < VidPn->NumPaths; Index++)
+        {
+            const DXGK_CHILD_CONNECTION_RECORD *Record =
+                DxgkChildFindConnectionRecord(Adapter->ChildConnectionRecords,
+                                             Adapter->ChildConnectionRecordCount,
+                                             VidPn->Paths[Index].VidPnTargetId);
+
+            if (Record == NULL || !Record->Observed || Record->Connected)
+                break;
+        }
+        Disconnected = Index == VidPn->NumPaths;
+        KeReleaseSpinLock(&Adapter->ChildListLock, OldIrql);
+    }
+    KeReleaseMutex(&Adapter->VidPnMutex, FALSE);
+    return Disconnected;
+}
+
+static VOID
+DxgkpPublishExpiredInheritedDisconnect(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    LONG64 Deadline = InterlockedCompareExchange64(&Adapter->InheritedDisconnectDeadline, 0, 0);
+    BOOLEAN Changed;
+
+    if (Deadline == 0 || KeQueryInterruptTime() < (ULONGLONG)Deadline ||
+        InterlockedCompareExchange(&Adapter->ConnectorChangePending, 0, 0) != 0 ||
+        InterlockedCompareExchange64(&Adapter->InheritedDisconnectDeadline, 0, Deadline) != Deadline)
+        return;
+
+    DXGKRNL_INFO("CONNECTOR_CHANGE: inherited target %u remained disconnected\n",
+                 Adapter->FirmwareTargetId);
+    if (NT_SUCCESS(DxgkPnpIndicateChildConnection(Adapter, Adapter->FirmwareTargetId,
+                                                 FALSE, &Changed)) && Changed)
+        IoInvalidateDeviceRelations(Adapter->PhysicalDeviceObject, BusRelations);
+}
+
 static VOID
 NTAPI
 DxgkpHotPlugRebuildWorker(
@@ -2825,6 +2932,9 @@ DxgkpHotPlugRebuildWorker(
         {
             DxgkpDrainConnectionChanges(Adapter);
         }
+        if (Adapter->State == DxgkAdapterStateStarted &&
+            InterlockedCompareExchange(&Adapter->RundownStarted, 0, 0) == 0)
+            DxgkpPublishExpiredInheritedDisconnect(Adapter);
         KeAcquireSpinLock(&Adapter->ChildListLock, &OldIrql);
         if (Adapter->State != DxgkAdapterStateStarted || InterlockedCompareExchange(&Adapter->RundownStarted, 0, 0) != 0)
         {
@@ -2835,6 +2945,15 @@ DxgkpHotPlugRebuildWorker(
         ObservedGeneration = Adapter->HotPlugGeneration;
         if (!DxgkHotPlugWorkCoreNeedsRebuildLocked(&Adapter->HotPlugGeneration, Adapter->HotPlugRebuiltGeneration))
         {
+            if (InterlockedCompareExchange64(&Adapter->InheritedDisconnectDeadline, 0, 0) != 0)
+            {
+                LARGE_INTEGER Delay;
+
+                KeReleaseSpinLock(&Adapter->ChildListLock, OldIrql);
+                Delay.QuadPart = -(LONGLONG)DXGK_HOTPLUG_RETRY_MAX_MS * 10000;
+                KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+                continue;
+            }
             if (InterlockedCompareExchange(&Adapter->ConnectorChangePending, 0, 0) != 0 ||
                 !DxgkHotPlugWorkCoreCompleteLocked(&Adapter->HotPlugGeneration, &Adapter->HotPlugWorkActive, ObservedGeneration, TRUE))
             {
@@ -2886,7 +3005,8 @@ DxgkpHotPlugRebuildWorker(
             DXGKRNL_ERR("DxgkpHotPlugRebuildWorker: adapter %p generation %I64d rebuild retired after %lu retries with 0x%08lX\n", Adapter, ObservedGeneration, RetryCount, Status);
         ASSERT(Adapter->HotPlugRebuiltGeneration < ObservedGeneration);
         Adapter->HotPlugRebuiltGeneration = ObservedGeneration;
-        if (InterlockedCompareExchange(&Adapter->ConnectorChangePending, 0, 0) != 0 ||
+        if (InterlockedCompareExchange64(&Adapter->InheritedDisconnectDeadline, 0, 0) != 0 ||
+            InterlockedCompareExchange(&Adapter->ConnectorChangePending, 0, 0) != 0 ||
             !DxgkHotPlugWorkCoreCompleteLocked(&Adapter->HotPlugGeneration, &Adapter->HotPlugWorkActive, ObservedGeneration, TRUE))
         {
             KeReleaseSpinLock(&Adapter->ChildListLock, OldIrql);
@@ -3489,6 +3609,58 @@ DxgkpRecommendTopologyFallback(
 }
 
 static NTSTATUS
+DxgkpPrepareInitialConnectedTopology(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _Inout_ PDXGKP_VIDPN VidPn)
+{
+    PDXGKP_HOTPLUG_MONITOR_SNAPSHOT Snapshot;
+    KIRQL OldIrql;
+    ULONG Index;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    Snapshot = ExAllocatePoolZero(PagedPool, sizeof(*Snapshot), TAG_DXGK_VIDPN);
+    if (!Snapshot)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    KeAcquireSpinLock(&Adapter->ChildListLock, &OldIrql);
+    for (Index = 0; Index < Adapter->ChildConnectionRecordCount; Index++)
+    {
+        const DXGK_CHILD_CONNECTION_RECORD *Record = &Adapter->ChildConnectionRecords[Index];
+
+        if (!Record->Observed || !Record->Connected ||
+            DxgkVidPnTargetIndexFromId(VidPn, Record->ChildUid) == MAXULONG)
+            continue;
+        if (!Snapshot->Connected)
+        {
+            Snapshot->Connected = TRUE;
+            Snapshot->ChildUid = Record->ChildUid;
+            Snapshot->TargetId = Record->ChildUid;
+        }
+        else if (Snapshot->ExtraCount < RTL_NUMBER_OF(Snapshot->Extra))
+        {
+            Snapshot->Extra[Snapshot->ExtraCount++].ChildUid = Record->ChildUid;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->ChildListLock, OldIrql);
+
+    if (Snapshot->Connected)
+    {
+        Status = DxgkpRefreshHotPlugEdid(Adapter, Snapshot);
+        if (NT_SUCCESS(Status))
+            Status = DxgkpBuildHotPlugCandidate(VidPn, Snapshot);
+        if (NT_SUCCESS(Status))
+            Status = DxgkpRecommendTopologyFallback(Adapter, VidPn, Snapshot, DXGK_RVT_INITIALIZATION_NOLKG);
+        if (NT_SUCCESS(Status))
+            Status = DxgkpSeedDefaultHotPlugPath(Adapter, VidPn, Snapshot);
+        DXGKRNL_INFO("CONNECTOR_CHANGE: initial target %u, %Iu path(s), status 0x%08lX\n",
+                     Snapshot->TargetId, VidPn->NumPaths, Status);
+    }
+
+    ExFreePoolWithTag(Snapshot, TAG_DXGK_VIDPN);
+    return Status;
+}
+
+static NTSTATUS
 DxgkpRecommendHotPlugCandidate(
     _In_ PDXGKRNL_ADAPTER Adapter,
     _In_ PDXGKP_VIDPN VidPn,
@@ -3610,6 +3782,8 @@ DxgkVidPnQueryFirmwareTiming(
     Adapter->FirmwareTimingValid = FALSE;
     Adapter->FirmwareWireFormat.Value = 0;
 
+    DXGKRNL_INFO("DISPLAY_MODE: adapter %p firmware dimensions %ux%u\n",
+                 Adapter, Adapter->PostDisplayWidth, Adapter->PostDisplayHeight);
     if (Adapter->MiniportContext == NULL ||
         Adapter->PostDisplayWidth == 0 || Adapter->PostDisplayHeight == 0)
     {
@@ -3647,7 +3821,7 @@ DxgkVidPnQueryFirmwareTiming(
         Status = DxgkpValidateRecommendedTopology(ScratchObject);
     if (!NT_SUCCESS(Status) || !DxgkPostDisplayCoreFirmwareTopologyUsable(ScratchObject->NumPaths))
     {
-        DXGKRNL_TRACE("DxgkVidPnQueryFirmwareTiming: driver did not describe a "
+        DXGKRNL_INFO("DxgkVidPnQueryFirmwareTiming: driver did not describe a "
                       "single-path firmware configuration (0x%08lX, %Iu paths); "
                       "nothing to preserve\n",
                       Status, ScratchObject->NumPaths);
@@ -3660,7 +3834,7 @@ DxgkVidPnQueryFirmwareTiming(
                     ScratchObject->TargetModeSets[TargetIndex] : NULL;
     if (TargetSet == NULL || TargetSet->PinnedModeId == (UINT)-1)
     {
-        DXGKRNL_TRACE("DxgkVidPnQueryFirmwareTiming: firmware path to target %u "
+        DXGKRNL_INFO("DxgkVidPnQueryFirmwareTiming: firmware path to target %u "
                       "names no pinned timing; nothing to preserve\n", TargetId);
         goto Done;
     }
@@ -3672,7 +3846,7 @@ DxgkVidPnQueryFirmwareTiming(
             Adapter->FirmwareTargetTiming = TargetSet->Modes[i].VideoSignalInfo;
             Adapter->FirmwareWireFormat = DxgkPostDisplayCoreFirmwareWireFormat(&FirmwareData);
             Adapter->FirmwareTimingValid = TRUE;
-            DXGKRNL_TRACE("DxgkVidPnQueryFirmwareTiming: firmware drives target "
+            DXGKRNL_INFO("DxgkVidPnQueryFirmwareTiming: firmware drives target "
                           "%u at %ux%u\n", TargetId,
                           Adapter->FirmwareTargetTiming.ActiveSize.cx,
                           Adapter->FirmwareTargetTiming.ActiveSize.cy);
@@ -8622,6 +8796,8 @@ DxgkVidPnSetVideoMode(
     Index = ModeIndex & DXGKP_DISPLAY_MODE_INDEX_MASK;
     if ((ModeIndex >> DXGKP_DISPLAY_MODE_INDEX_BITS) != Cache->Generation || Index >= Cache->Count)
     {
+        DXGKRNL_WARN("DISPLAY_MODE: rejected index 0x%08lX, cache generation %lu, entries %lu\n",
+                     ModeIndex, Cache->Generation, Cache->Count);
         Status = STATUS_INVALID_PARAMETER;
         goto Cleanup;
     }

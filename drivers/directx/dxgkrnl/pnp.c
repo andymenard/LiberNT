@@ -1442,7 +1442,21 @@ DxgkPnpCacheInitialChildRelations(
                  Adapter->MiniportDeviceContext, Children, ChildrenSize);
     if (NT_SUCCESS(Status))
     {
+        ULONG Index;
+
         DxgkChildNormalizeDescriptors(Children, Adapter->NumberOfChildren + 1);
+        for (Index = 0; Index < Adapter->NumberOfChildren; Index++)
+        {
+            const DXGK_CHILD_DESCRIPTOR *Child = &Children[Index];
+
+            if (Child->ChildDeviceType == TypeVideoOutput)
+            {
+                DXGKRNL_INFO("DISPLAY_PROBE: adapter %p child %lu ACPI %lu output %u HPD %u\n",
+                             Adapter, Child->ChildUid, Child->AcpiUid,
+                             (UINT)Child->ChildCapabilities.Type.VideoOutput.InterfaceTechnology,
+                             (UINT)Child->ChildCapabilities.HpdAwareness);
+            }
+        }
         RecordCount = DxgkChildInitializeConnectionRecords(Children, Adapter->NumberOfChildren,
                                                            Records, Adapter->NumberOfChildren);
         KeAcquireSpinLock(&Adapter->ChildListLock, &OldIrql);
@@ -1483,7 +1497,7 @@ DxgkpCallDisplayDetectControl(
         Status = _SEH2_GetExceptionCode();
     }
     _SEH2_END;
-    DXGKRNL_TRACE("DxgkDdiDisplayDetectControl: adapter %p type %u -> 0x%08lX\n",
+    DXGKRNL_INFO("DxgkDdiDisplayDetectControl: adapter %p type %u -> 0x%08lX\n",
                   Adapter, (UINT)Type, Status);
     return Status;
 }
@@ -1518,6 +1532,7 @@ DxgkPnpEnableHotPlugDetection(
         return Status;
     }
     Adapter->HotPlugDetectEnabled = TRUE;
+    (VOID)DxgkpCallDisplayDetectControl(Adapter, DisplayDetectControl, DXGK_DDCT_POLLALL);
     return STATUS_SUCCESS;
 }
 

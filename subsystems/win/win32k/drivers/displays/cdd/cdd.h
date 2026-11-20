@@ -44,6 +44,7 @@ typedef struct _RCDD_PDEV
    ULONG ModeIndex;
    ULONG ScreenWidth;
    ULONG ScreenHeight;
+   ULONG ScreenRefresh;
    ULONG ScreenDelta;          /* Stride in bytes                            */
    BYTE BitsPerPixel;
    ULONG RedMask;
@@ -190,6 +191,9 @@ RcddDeleteDeviceBitmapEx(
    IN OUT DHSURF dhsurf);
 
 /* ---- screen.c : modes + assert-mode ------------------------------------- */
+
+BOOL
+RcddCommitMode(PRCDD_PDEV ppdev, BOOL ReuseCurrent);
 
 BOOL APIENTRY
 RcddAssertMode(

@@ -112,8 +112,9 @@ DxgkpDeliverAcpiEvent(
     _SEH2_END;
     DxgkReleaseKmdCall(Adapter);
 
-    DXGKRNL_TRACE("DxgkpDeliverAcpiEvent: type=%d code=0x%lx -> 0x%08lx "
-                  "flags=0x%lx\n", Record->Type, Record->Event, Status, Flags);
+    DXGKRNL_INFO("DISPLAY_EVENT: adapter %p type=%d code=0x%lx argument=%lu present=%u -> 0x%08lx flags=0x%lx\n",
+                 Adapter, Record->Type, Record->Event, Record->Argument,
+                 (UINT)Record->HasArgument, Status, Flags);
 
     /* The flags are meaningful only when the call succeeded. */
     if (!NT_SUCCESS(Status))

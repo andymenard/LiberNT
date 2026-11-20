@@ -13791,6 +13791,8 @@ DxgkpDestroyAdapterVidPn(
     Adapter->VidPn = NULL;
     Adapter->VidPnCommitted = FALSE;
     Adapter->HeadlessDesktop = FALSE;
+    InterlockedExchange64(&Adapter->InheritedHandoffTime, 0);
+    InterlockedExchange64(&Adapter->InheritedDisconnectDeadline, 0);
     DxgkVidPnPublishVsyncTargetMap(Adapter, NULL);
     Adapter->CommittedWidth = 0;
     Adapter->CommittedHeight = 0;
@@ -15127,6 +15129,7 @@ DxgkAdapterStart(
         Adapter->ReportedColorimetryValid = FALSE;
         /* A started miniport holds no timings yet. */
         Adapter->CommittedTargetCount = 0;
+        DxgkVidPnDrainInitialConnectionChanges(Adapter);
         Status = DxgkVidPnCreateForAdapter(Adapter, &hVidPn);
         VidPnUs = DxgkpTraceElapsedUs(StepStart100ns);
         if (NT_SUCCESS(Status))
@@ -15136,10 +15139,6 @@ DxgkAdapterStart(
             KeReleaseMutex(&Adapter->VidPnMutex, FALSE);
             Progress.VidPnCreated = TRUE;
             DXGKRNL_TRACE("DxgkAdapterStart: VidPN created %p\n", hVidPn);
-
-            /* Before the first commit: learn what firmware left running, so
-             * that commit can keep it instead of retraining the link. */
-            DxgkVidPnQueryFirmwareTiming(Adapter, hVidPn);
         }
         else
         {
@@ -15296,6 +15295,7 @@ DxgkAdapterStart(
         RegisterDisplayBridge = DxgkpShouldRegisterDisplayBridge(Adapter);
         if (RegisterDisplayBridge)
         {
+            DxgkVidPnQueryFirmwareTiming(Adapter, (D3DKMDT_HVIDPN)Adapter->VidPn);
             Status = DxgkDisplayRegister(Adapter);
             if (!NT_SUCCESS(Status))
             {

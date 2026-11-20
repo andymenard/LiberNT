@@ -2994,7 +2994,6 @@ DxgkpDisplayCommitVidPnCandidateWithTarget(
             }
             Timing->Input.VidPnPathUpdates = WasTimed ? DXGK_PATH_UPDATE_MODIFIED : DXGK_PATH_UPDATE_ADDED;
             Timing->Input.Active = 1;
-            Timing->Input.IgnoreConnectivity = 1;
             /* Only when the path carries the very timing the driver
              * described as inherited from firmware: asking it to preserve
              * anything else would leave it guessing what "inherited" means. */
@@ -3089,6 +3088,21 @@ DxgkpDisplayCommitVidPnCandidateWithTarget(
             Status = STATUS_DATA_ERROR;
             goto Cleanup;
         }
+        for (i = 0; i < TimingCount; i++)
+        {
+            DXGKRNL_INFO("DISPLAY_MODE: target %u flags 0x%08X wire 0x%08X state %u result 0x%08X\n",
+                         TimingPaths[i].VidPnTargetId, TimingPaths[i].InputFlags,
+                         TimingPaths[i].SelectedWireFormat.Value,
+                         (UINT)TimingPaths[i].TargetState.ConnectionStatus, TimingResults.Value);
+        }
+
+        if (TimingPaths[0].Input.PreserveInherited &&
+            TimingPaths[0].TargetState.ConnectionStatus == LinkConfigurationSucceeded &&
+            Adapter->PostDisplayHandoffCore.FallbackStopped)
+        {
+            InterlockedExchange64(&Adapter->InheritedHandoffTime, KeQueryInterruptTime());
+        }
+
         /* The miniport now has timings for exactly these outputs. */
         Adapter->CommittedTargetCount = 0;
         for (i = 0; !TopologyEmpty && i < VidPn->NumPaths; i++)
@@ -3903,7 +3917,7 @@ DxgkDisplayPresentBootScreen(
     Rect.right = (LONG)Adapter->CommittedWidth;
     Rect.bottom = (LONG)Adapter->CommittedHeight;
     Status = DxgkpPresentSourceRects(Adapter, Pixels, Pitch, Size, &Rect, 1, "boot");
-    DXGKRNL_TRACE("DxgkDisplayPresentBootScreen: adapter %p %lux%lu status 0x%08lX\n",
+    DXGKRNL_INFO("DxgkDisplayPresentBootScreen: adapter %p %lux%lu status 0x%08lX\n",
                   Adapter, Adapter->CommittedWidth, Adapter->CommittedHeight, Status);
     ExFreePoolWithTag(Pixels, TAG_DXGK_PRESENT);
 }
@@ -5362,6 +5376,13 @@ DxgkpDisplayDispatch(
         }
     }
 
+    if (!NT_SUCCESS(Status) &&
+        (Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_VIDEO_SET_CURRENT_MODE ||
+         Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_VIDEO_MAP_VIDEO_MEMORY))
+    {
+        DXGKRNL_WARN("DISPLAY_MODE: display IOCTL 0x%08lX failed 0x%08lX\n",
+                     Stack->Parameters.DeviceIoControl.IoControlCode, Status);
+    }
     Irp->IoStatus.Status = Status;
     Irp->IoStatus.Information = BytesReturned;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -5733,6 +5754,26 @@ DxgkDisplayRegister(
             {
                 DXGKRNL_ERR("DxgkDisplayRegister: initial VidPN commit failed 0x%08lX\n",
                             Status);
+                goto Cleanup;
+            }
+        }
+
+        if (Adapter->HeadlessDesktop && Adapter->PostDisplayHandoffCore.FallbackStopped)
+        {
+            DXGKRNL_WARN("DISPLAY_BRIDGE: adapter %p has no scanout for the BasicDisplay handoff\n",
+                         Adapter);
+            Status = STATUS_GRAPHICS_INVALID_VIDPN_TOPOLOGY;
+            goto Cleanup;
+        }
+
+        if (Adapter->PostDisplayHandoffCore.FallbackStopped)
+        {
+            DxgkVidPnDrainInitialConnectionChanges(Adapter);
+            if (DxgkVidPnAllActiveTargetsDisconnected(Adapter))
+            {
+                DXGKRNL_WARN("DISPLAY_BRIDGE: adapter %p lost its outputs during the mode set\n",
+                             Adapter);
+                Status = STATUS_GRAPHICS_INVALID_VIDPN_TOPOLOGY;
                 goto Cleanup;
             }
         }

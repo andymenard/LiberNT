@@ -1360,6 +1360,8 @@ struct _DXGKRNL_ADAPTER
     volatile LONG               VsyncPending;
     volatile LONG               ScanoutModeChangePending;
     volatile LONG               DeferredVisibleSourceMask;
+    volatile LONG64             InheritedHandoffTime;
+    volatile LONG64             InheritedDisconnectDeadline;
     ULONG                       ScanoutModeChangeWidth[32];
     ULONG                       ScanoutModeChangeHeight[32];
     /* The ISR records the effective scan address independently of the
@@ -3816,6 +3818,14 @@ DxgkVidPnRebuildForHotPlug(
 
 NTSTATUS
 DxgkVidPnQueueHotPlugRebuild(
+    _In_ PDXGKRNL_ADAPTER Adapter);
+
+VOID
+DxgkVidPnDrainInitialConnectionChanges(
+    _In_ PDXGKRNL_ADAPTER Adapter);
+
+BOOLEAN
+DxgkVidPnAllActiveTargetsDisconnected(
     _In_ PDXGKRNL_ADAPTER Adapter);
 
 NTSTATUS
