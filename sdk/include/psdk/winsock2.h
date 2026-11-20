@@ -463,6 +463,7 @@ struct protoent {
 #define WSA_FLAG_MULTIPOINT_D_ROOT          0x08
 #define WSA_FLAG_MULTIPOINT_D_LEAF          0x10
 #define WSA_FLAG_ACCESS_SYSTEM_SECURITY     0x40
+#define WSA_FLAG_NO_HANDLE_INHERIT          0x80
 
 #define TH_NETDEV                           0x00000001
 #define TH_TAPI                             0x00000002

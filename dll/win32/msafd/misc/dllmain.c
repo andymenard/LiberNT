@@ -235,6 +235,18 @@ WSPSocket(int AddressFamily,
         Socket->SharedDataHandle = INVALID_HANDLE_VALUE;
         Sock = UlongToHandle(lpProtocolInfo->dwServiceFlags4);
         Socket->Handle = (SOCKET)lpProtocolInfo->dwServiceFlags4;
+
+        /* WSPDuplicateSocket hands over a non-inheritable handle. Like any
+         * other new socket, this one is inheritable unless the caller asked
+         * for WSA_FLAG_NO_HANDLE_INHERIT. */
+        if (!SetHandleInformation(Sock,
+                                  HANDLE_FLAG_INHERIT,
+                                  (dwFlags & WSA_FLAG_NO_HANDLE_INHERIT) ? 0 : HANDLE_FLAG_INHERIT))
+        {
+            NtClose(Sock);
+            Status = WSAEINVAL;
+            goto error;
+        }
     }
     else
     {
@@ -393,7 +405,8 @@ WSPSocket(int AddressFamily,
     /* Set up Object Attributes */
     InitializeObjectAttributes (&Object,
                                 &DevName,
-                                OBJ_CASE_INSENSITIVE | OBJ_INHERIT,
+                                OBJ_CASE_INSENSITIVE |
+                                ((dwFlags & WSA_FLAG_NO_HANDLE_INHERIT) ? 0 : OBJ_INHERIT),
                                 0,
                                 0);
 
