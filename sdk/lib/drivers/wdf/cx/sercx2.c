@@ -1766,6 +1766,11 @@ SerCx2EvtIoDeviceControl(
             KeAcquireSpinLock(&Device->Lock, &OldIrql);
             Device->Timeouts = *(PSERIAL_TIMEOUTS)Buffer;
             KeReleaseSpinLock(&Device->Lock, OldIrql);
+            /* TEMPORARY Surface diag: remove before commit */
+            DPRINT1("SerCx2 diag: timeouts read interval %lu, read total %lu*n+%lu, write total %lu*n+%lu\n",
+                    Device->Timeouts.ReadIntervalTimeout, Device->Timeouts.ReadTotalTimeoutMultiplier,
+                    Device->Timeouts.ReadTotalTimeoutConstant, Device->Timeouts.WriteTotalTimeoutMultiplier,
+                    Device->Timeouts.WriteTotalTimeoutConstant);
             Status = STATUS_SUCCESS;
             break;
 
