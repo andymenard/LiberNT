@@ -760,6 +760,37 @@ SerCx2NonPioFinish(
     SerCx2NonPioRequestDone(Device, Transaction);
 }
 
+
+/* TEMPORARY Surface diag: remove before commit. Hex dump of a transfer buffer. */
+static
+VOID
+SerCx2DiagDump(
+    _In_ PCSTR What,
+    _In_opt_ PMDL Mdl,
+    _In_ size_t Length)
+{
+    static LONG DiagDumps;
+    PUCHAR Data;
+    CHAR Text[3 * 40 + 1];
+    size_t i, n;
+
+    if (Mdl == NULL || InterlockedIncrement(&DiagDumps) > 40)
+        return;
+    Data = (PUCHAR)MmGetSystemAddressForMdlSafe(Mdl, NormalPagePriority | MdlMappingNoExecute);
+    if (Data == NULL)
+        return;
+    n = min(Length, (size_t)40);
+    for (i = 0; i < n; i++)
+    {
+        static const CHAR Hex[] = "0123456789abcdef";
+        Text[3 * i] = Hex[Data[i] >> 4];
+        Text[3 * i + 1] = Hex[Data[i] & 15];
+        Text[3 * i + 2] = ' ';
+    }
+    Text[3 * n] = 0;
+    DPRINT1("SerCx2 diag: %s %Iu bytes: %s\n", What, Length, Text);
+}
+
 static
 VOID
 NTAPI
@@ -779,6 +810,8 @@ SerCx2EvtRequestCleanup(
     Device = SerCx2GetDeviceContext(Context->CustomDevice);
     Transaction = Context->CustomReceive ? &Device->Rx : &Device->Tx;
     Context->CustomDevice = NULL;
+    if (Context->CustomReceive && Transaction->Request == (WDFREQUEST)Object)
+        SerCx2DiagDump("rx data", Transaction->Mdl, (size_t)WdfRequestGetInformation((WDFREQUEST)Object));
 
     KeAcquireSpinLock(&Device->Lock, &OldIrql);
     if (Transaction->Request != (WDFREQUEST)Object || Transaction->Type != SerCx2TransactionTypeCustom ||
@@ -940,6 +973,8 @@ SerCx2CustomStart(
     RequestContext->CustomDevice = SerCx2DeviceHandle(Device);
     RequestContext->CustomReceive = Receive;
     DPRINT1("SerCx2 diag: custom %s start, request %p, %lu bytes\n", Receive ? "rx" : "tx", Request, Length);
+    if (!Receive)
+        SerCx2DiagDump("tx data", Transaction->Mdl, Length);
     if (Receive)
     {
         Custom->RxConfig.EvtSerCx2CustomReceiveTransactionStart((SERCX2CUSTOMRECEIVETRANSACTION)Handle, Request,
