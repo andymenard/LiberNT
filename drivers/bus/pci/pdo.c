@@ -5554,17 +5554,27 @@ NTAPI
 PciDiagLpssDumpThread(
     _In_ PVOID Context)
 {
-    static const ULONG Delays[] = { 0, 6, 15, 40 };
+    static const ULONG Delays[] = { 0, 3, 6, 15, 40 };
+    PPDO_DEVICE_EXTENSION DeviceExtension = (PPDO_DEVICE_EXTENSION)Context;
     PHYSICAL_ADDRESS Bar;
     LARGE_INTEGER Interval;
     volatile ULONG *Regs;
-    ULONG Pass;
+    ULONG Pass, Cmd = 0, Bar0 = 0, Bar1 = 0, Pm = 0;
+    UCHAR PmCap = DeviceExtension->PciDevice->PmCapability;
 
-    Bar.QuadPart = (LONGLONG)(ULONG_PTR)Context;
     for (Pass = 0; Pass < RTL_NUMBER_OF(Delays); Pass++)
     {
-        Interval.QuadPart = -(LONGLONG)Delays[Pass] * 10000000LL;
-        if (Delays[Pass]) KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+        Interval.QuadPart = -(LONGLONG)(Delays[Pass] - (Pass ? Delays[Pass - 1] : 0)) * 10000000LL;
+        if (Interval.QuadPart) KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+
+        PciPdoGetBusDataByOffset(DeviceExtension, &Cmd, 0x04, sizeof(Cmd));
+        PciPdoGetBusDataByOffset(DeviceExtension, &Bar0, 0x10, sizeof(Bar0));
+        PciPdoGetBusDataByOffset(DeviceExtension, &Bar1, 0x14, sizeof(Bar1));
+        if (PmCap) PciPdoGetBusDataByOffset(DeviceExtension, &Pm, PmCap + 4, sizeof(Pm));
+        DPRINT1("lpss diag: +%lus config cmd/status 0x%08lx bar0 0x%08lx bar1 0x%08lx pmcsr 0x%08lx (cap 0x%x)\n",
+                Delays[Pass], Cmd, Bar0, Bar1, Pm, PmCap);
+        Bar.QuadPart = ((ULONGLONG)Bar1 << 32) | (Bar0 & ~0xFUL);
+        if (Bar.QuadPart == 0) continue;
 
         Regs = (volatile ULONG *)MmMapIoSpace(Bar, 0x1000, MmNonCached);
         if (!Regs)
@@ -5604,7 +5614,7 @@ PciDiagStartLpssDump(
         Bar |= (ULONGLONG)Config->u.type0.BaseAddresses[1] << 32;
     DPRINT1("lpss diag: UART BAR0 %I64x\n", Bar);
     if (Bar && NT_SUCCESS(PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
-                                               PciDiagLpssDumpThread, (PVOID)(ULONG_PTR)Bar)))
+                                               PciDiagLpssDumpThread, DeviceExtension)))
     {
         ZwClose(Thread);
     }
