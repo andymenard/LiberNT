@@ -1065,6 +1065,7 @@ BOOL WINAPI CryptStringToBinaryA(LPCSTR pszString,
 {
     StringToBinaryAFunc decoder;
     LONG ret;
+    BOOL strict;
 
     TRACE("(%s, %ld, %08lx, %p, %p, %p, %p)\n", debugstr_an(pszString, cchString ? cchString : -1),
      cchString, dwFlags, pbBinary, pcbBinary, pdwSkip, pdwFlags);
@@ -1074,6 +1075,10 @@ BOOL WINAPI CryptStringToBinaryA(LPCSTR pszString,
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    /* CRYPT_STRING_STRICT may accompany any type: it stops text that is
+     * not Base64 from being decoded as binary data. */
+    strict = (dwFlags & CRYPT_STRING_STRICT) != 0;
+    dwFlags &= ~CRYPT_STRING_STRICT;
     /* Only the bottom byte contains valid types */
     if (dwFlags & 0xfffffff0)
     {
@@ -1101,7 +1106,7 @@ BOOL WINAPI CryptStringToBinaryA(LPCSTR pszString,
         decoder = DecodeBinaryToBinaryA;
         break;
     case CRYPT_STRING_ANY:
-        decoder = DecodeAnyA;
+        decoder = strict ? Base64AnyToBinaryA : DecodeAnyA;
         break;
     case CRYPT_STRING_HEX:
         decoder = string_to_hexA;
@@ -1283,6 +1288,7 @@ BOOL WINAPI CryptStringToBinaryW(LPCWSTR pszString,
 {
     StringToBinaryWFunc decoder;
     LONG ret;
+    BOOL strict;
 
     TRACE("(%s, %ld, %08lx, %p, %p, %p, %p)\n", debugstr_wn(pszString, cchString ? cchString : -1),
      cchString, dwFlags, pbBinary, pcbBinary, pdwSkip, pdwFlags);
@@ -1292,6 +1298,10 @@ BOOL WINAPI CryptStringToBinaryW(LPCWSTR pszString,
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    /* CRYPT_STRING_STRICT may accompany any type: it stops text that is
+     * not Base64 from being decoded as binary data. */
+    strict = (dwFlags & CRYPT_STRING_STRICT) != 0;
+    dwFlags &= ~CRYPT_STRING_STRICT;
     /* Only the bottom byte contains valid types */
     if (dwFlags & 0xfffffff0)
     {
@@ -1319,7 +1329,7 @@ BOOL WINAPI CryptStringToBinaryW(LPCWSTR pszString,
         decoder = DecodeBinaryToBinaryW;
         break;
     case CRYPT_STRING_ANY:
-        decoder = DecodeAnyW;
+        decoder = strict ? Base64AnyToBinaryW : DecodeAnyW;
         break;
     case CRYPT_STRING_HEX:
         decoder = string_to_hexW;
