@@ -486,6 +486,12 @@ Ndis6WdiQueueFrame(
     return NDIS_STATUS_SUCCESS;
 }
 
+
+/* TEMPORARY Surface diag: remove before commit. Logs the first transmits. */
+static LONG Ndis6WdiDiagTxLines;
+#define NDIS6_WDI_DIAG_TX(...) \
+    do { if (InterlockedIncrement(&Ndis6WdiDiagTxLines) <= 60) DbgPrint(__VA_ARGS__); } while (0)
+
 VOID
 NTAPI
 Ndis6WdiSendNetBufferLists(
@@ -509,6 +515,8 @@ Ndis6WdiSendNetBufferLists(
         NET_BUFFER_LIST_NEXT_NBL(Nbl) = NULL;
 
         Status = Ndis6WdiQueueFrame(Wdi, Nbl, FALSE, NULL);
+        NDIS6_WDI_DIAG_TX("WDI tx: queue nbl %p len %lu -> 0x%08lx\n", Nbl,
+                          NET_BUFFER_LIST_FIRST_NB(Nbl) ? NET_BUFFER_DATA_LENGTH(NET_BUFFER_LIST_FIRST_NB(Nbl)) : 0, Status);
         if (Status == NDIS_STATUS_SUCCESS)
             continue;
 
@@ -677,6 +685,8 @@ Ndis6WdiTxDequeue(
     }
     KeReleaseSpinLock(&Wdi->TxLock, OldIrql);
 
+    NDIS6_WDI_DIAG_TX("WDI tx: dequeue %lu frame(s), %lu bytes (quantum %lu max %u credit %u)\n",
+                      Count, Bytes, (ULONG)Quantum, MaxNumFrames, Credit);
     *ppNBL = Head;
 }
 
@@ -694,6 +704,8 @@ Ndis6WdiTxTransferComplete(
     PNET_BUFFER_LIST Next;
     ULONG Count;
     KIRQL OldIrql;
+
+    NDIS6_WDI_DIAG_TX("WDI tx: transfer complete status %lu nbl %p\n", (ULONG)WifiTxFrameStatus, pNBL);
 
     while (Nbl != NULL)
     {
@@ -746,6 +758,8 @@ Ndis6WdiTxSendComplete(
     KIRQL OldIrql;
 
     UNREFERENCED_PARAMETER(WifiTxCompleteList);
+
+    NDIS6_WDI_DIAG_TX("WDI tx: send complete status %lu, %u frame(s)\n", (ULONG)WifiTxFrameStatus, NumCompletedSends);
 
     while (Index < NumCompletedSends)
     {

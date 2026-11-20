@@ -5545,6 +5545,72 @@ PciPdoProgramBridgeWindows(
     return STATUS_SUCCESS;
 }
 
+
+/* TEMPORARY Surface diag: remove before commit. Dumps the Intel LPSS UART
+ * (8086:9D27) private, UART and iDMA registers a few times after it starts. */
+static
+VOID
+NTAPI
+PciDiagLpssDumpThread(
+    _In_ PVOID Context)
+{
+    static const ULONG Delays[] = { 0, 6, 15, 40 };
+    PHYSICAL_ADDRESS Bar;
+    LARGE_INTEGER Interval;
+    volatile ULONG *Regs;
+    ULONG Pass;
+
+    Bar.QuadPart = (LONGLONG)(ULONG_PTR)Context;
+    for (Pass = 0; Pass < RTL_NUMBER_OF(Delays); Pass++)
+    {
+        Interval.QuadPart = -(LONGLONG)Delays[Pass] * 10000000LL;
+        if (Delays[Pass]) KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+
+        Regs = (volatile ULONG *)MmMapIoSpace(Bar, 0x1000, MmNonCached);
+        if (!Regs)
+        {
+            DPRINT1("lpss diag: cannot map %I64x\n", Bar.QuadPart);
+            return;
+        }
+#define R(off) READ_REGISTER_ULONG((PULONG)((PUCHAR)Regs + (off)))
+        DPRINT1("lpss diag: +%lus clk 0x%08lx resets 0x%08lx remap 0x%08lx%08lx caps 0x%08lx\n",
+                Delays[Pass], R(0x200), R(0x204), R(0x244), R(0x240), R(0x2FC));
+        DPRINT1("lpss diag: +%lus uart ier 0x%02lx lcr 0x%02lx mcr 0x%02lx usr 0x%02lx tfl %lu rfl %lu\n",
+                Delays[Pass], R(0x04) & 0xFF, R(0x0C) & 0xFF, R(0x10) & 0xFF, R(0x7C) & 0xFF, R(0x80), R(0x84));
+        DPRINT1("lpss diag: +%lus idma cfg 0x%08lx chen 0x%08lx rawtfr 0x%08lx rawerr 0x%08lx statint 0x%08lx masktfr 0x%08lx\n",
+                Delays[Pass], R(0xB98), R(0xBA0), R(0xAC0), R(0xAE0), R(0xB60), R(0xB10));
+        DPRINT1("lpss diag: +%lus ch0 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx | ch1 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx\n",
+                Delays[Pass], R(0x800), R(0x808), R(0x81C), R(0x818), R(0x844), R(0x840),
+                R(0x858), R(0x860), R(0x874), R(0x870), R(0x89C), R(0x898));
+#undef R
+        MmUnmapIoSpace((PVOID)Regs, 0x1000);
+    }
+}
+
+static
+VOID
+PciDiagStartLpssDump(
+    _In_ PPDO_DEVICE_EXTENSION DeviceExtension)
+{
+    PPCI_COMMON_CONFIG Config = &DeviceExtension->PciDevice->PciConfig;
+    ULONGLONG Bar;
+    HANDLE Thread;
+
+    if (Config->VendorID != 0x8086 || Config->DeviceID != 0x9D27)
+        return;
+
+    Bar = Config->u.type0.BaseAddresses[0] & ~0xFULL;
+    if ((Config->u.type0.BaseAddresses[0] & 0x6) == 0x4)
+        Bar |= (ULONGLONG)Config->u.type0.BaseAddresses[1] << 32;
+    DPRINT1("lpss diag: UART BAR0 %I64x\n", Bar);
+    if (Bar && NT_SUCCESS(PsCreateSystemThread(&Thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                               PciDiagLpssDumpThread, (PVOID)(ULONG_PTR)Bar)))
+    {
+        ZwClose(Thread);
+    }
+}
+
+
 static NTSTATUS
 PdoStartDevice(
     IN PDEVICE_OBJECT DeviceObject,
@@ -5929,6 +5995,7 @@ PdoStartDevice(
                 DeviceExtension->PciDevice->SlotNumber.u.AsULONG,
                 Command,
                 DeviceExtension->PciDevice->PciConfig.Command);
+        PciDiagStartLpssDump(DeviceExtension);
     }
     else
     {
