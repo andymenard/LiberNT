@@ -5554,7 +5554,7 @@ NTAPI
 PciDiagLpssDumpThread(
     _In_ PVOID Context)
 {
-    static const ULONG Delays[] = { 0, 3, 6, 15, 40 };
+    static const ULONG Delays[] = { 0, 2, 3, 4, 5, 6, 7, 8, 10, 15, 25, 40 };
     PPDO_DEVICE_EXTENSION DeviceExtension = (PPDO_DEVICE_EXTENSION)Context;
     PHYSICAL_ADDRESS Bar;
     LARGE_INTEGER Interval;
@@ -5592,6 +5592,13 @@ PciDiagLpssDumpThread(
         DPRINT1("lpss diag: +%lus ch0 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx | ch1 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx\n",
                 Delays[Pass], R(0x800), R(0x808), R(0x81C), R(0x818), R(0x844), R(0x840),
                 R(0x858), R(0x860), R(0x874), R(0x870), R(0x89C), R(0x898));
+        /* EXPERIMENT: switch the iDMA on if the UART is out of reset and it is still off */
+        if ((Pm & 3) == 0 && (R(0x204) & 4) && R(0xB98) == 0)
+        {
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)Regs + 0xB98), 1);
+            DPRINT1("lpss diag: +%lus iDMA was off with the UART out of reset; enabled it, cfg now 0x%08lx\n",
+                    Delays[Pass], R(0xB98));
+        }
 #undef R
         MmUnmapIoSpace((PVOID)Regs, 0x1000);
     }
