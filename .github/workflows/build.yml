@@ -1,7 +1,7 @@
 name: Build
 on:
   push:
-    branches: [master]
+    branches: [master, surface-laptop-test]
   pull_request:
   # Saves the pull request configuration's ccache on the default branch, the only cache a new pull request can restore
   schedule:
@@ -27,7 +27,8 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-24.04
     env:
-      BUILD_TYPE: ${{ github.event_name == 'push' && 'release' || 'debug' }}
+      # Surface Laptop test branch: always a debug build, which also makes LiberNT.img
+      BUILD_TYPE: debug
       CCACHE_KEY: ccache-${{ github.event_name == 'push' && 'release-' || '' }}${{matrix.compiler}}-${{matrix.arch}}${{matrix.variant}}-
       # Surface Laptop test branch: a run started by hand uploads its images
       CCACHE_SEED: ${{ github.event_name == 'schedule' }}
