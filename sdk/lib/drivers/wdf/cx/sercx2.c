@@ -83,6 +83,7 @@ typedef struct _SERCX2_DEVICE_CONTEXT
     BOOLEAN HasRequestAttributes;
     BOOLEAN Initialized;
     BOOLEAN Opened;
+    BOOLEAN HoldsPower;
     BOOLEAN HasConnectionId;
     LARGE_INTEGER ConnectionId;
     WDFQUEUE Queue;
@@ -1811,11 +1812,32 @@ SerCx2EvtCxDeviceFileCreate(
     if (Device->HasConnectionId)
         Status = SerCx2ApplyConnectionConfig(DeviceHandle, Device);
 
+    /*
+     * Like Microsoft's SerCx2, keep the controller in D0 for as long as the
+     * port is open. Reads and writes leave the power-managed default queue for
+     * manual queues while the controller's DMA works on them; without this
+     * KMDF idles the controller to D3 in the middle of a transfer (the Intel
+     * LPSS UART behind the Surface Laptop keyboard then reads all ones).
+     */
+    if (NT_SUCCESS(Status))
+    {
+        Status = WdfDeviceStopIdle(DeviceHandle, TRUE);
+        if (NT_SUCCESS(Status))
+            Device->HoldsPower = TRUE;
+        else
+            DPRINT1("SerCx2: WdfDeviceStopIdle failed 0x%08lx\n", Status);
+    }
+
     if (NT_SUCCESS(Status) && Device->Config.EvtSerCx2FileOpen != NULL)
         Status = Device->Config.EvtSerCx2FileOpen(DeviceHandle);
 
     if (NT_SUCCESS(Status))
         Device->Opened = TRUE;
+    else if (Device->HoldsPower)
+    {
+        Device->HoldsPower = FALSE;
+        WdfDeviceResumeIdle(DeviceHandle);
+    }
 
     WdfRequestComplete(Request, Status);
     return TRUE;
@@ -1839,6 +1861,12 @@ SerCx2EvtFileClose(
     Device->Opened = FALSE;
     if (Device->Config.EvtSerCx2FileClose != NULL)
         Device->Config.EvtSerCx2FileClose(DeviceHandle);
+
+    if (Device->HoldsPower)
+    {
+        Device->HoldsPower = FALSE;
+        WdfDeviceResumeIdle(DeviceHandle);
+    }
 }
 
 static
