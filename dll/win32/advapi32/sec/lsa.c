@@ -1062,6 +1062,47 @@ LsaLookupPrivilegeValue(IN LSA_HANDLE PolicyHandle,
 
 
 /*
+ * @unimplemented
+ *
+ * LiberNT's LSA has no SID/name mapping table yet. Report a non-mapping
+ * error through an output block the caller frees with LsaFreeMemory, as
+ * Windows does when an operation fails before reaching the mapping table.
+ */
+NTSTATUS
+NTAPI
+LsaManageSidNameMapping(IN LSA_SID_NAME_MAPPING_OPERATION_TYPE OperationType,
+                        IN PLSA_SID_NAME_MAPPING_OPERATION_INPUT OperationInput,
+                        OUT PLSA_SID_NAME_MAPPING_OPERATION_OUTPUT *OperationOutput)
+{
+    PLSA_SID_NAME_MAPPING_OPERATION_OUTPUT Output;
+
+    FIXME("LsaManageSidNameMapping(%d %p %p) stub\n",
+          OperationType, OperationInput, OperationOutput);
+
+    if (OperationInput == NULL || OperationOutput == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    *OperationOutput = NULL;
+
+    if (OperationType != LsaSidNameMappingOperation_Add &&
+        OperationType != LsaSidNameMappingOperation_Remove &&
+        OperationType != LsaSidNameMappingOperation_AddMultiple)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Output = RtlAllocateHeap(RtlGetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*Output));
+    if (Output == NULL)
+        return STATUS_NO_MEMORY;
+
+    Output->AddOutput.ErrorCode = LsaSidNameMappingOperation_NonMappingError;
+    *OperationOutput = Output;
+
+    return STATUS_NOT_SUPPORTED;
+}
+
+
+/*
  * @implemented
  */
 NTSTATUS
