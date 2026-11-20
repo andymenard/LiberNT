@@ -5869,23 +5869,15 @@ PdoStartDevice(
             DeviceExtension->PciDevice->SlotNumber.u.AsULONG,
             DeviceExtension->PciDevice->BusNumber);
     /*
-     * A message-signalled interrupt is a memory write issued by the function
-     * itself, so a device routed to MSI or MSI-X cannot signal at all unless
-     * it is a bus master.  EnableBusMaster is only set while answering
-     * IRP_MN_QUERY_RESOURCES, which the PnP manager need not send, and the
-     * cached command register only carries the bit when firmware happened to
-     * leave the device enabled -- neither is true of a discrete adapter the
-     * firmware did not boot from.  Starting such a device with the legacy
-     * line already disconnected leaves it with no interrupt at all.
+     * Like Windows, start every function as a bus master. A device routed to
+     * MSI or MSI-X cannot signal without it, and drivers of devices with their
+     * own DMA engine, such as the Intel LPSS UART's integrated DMA, never set
+     * it themselves: their transfers would never complete. EnableBusMaster is
+     * only set while answering IRP_MN_QUERY_RESOURCES, which the PnP manager
+     * need not send, and firmware leaves the bit on only for devices it used.
      */
-    if (DeviceExtension->PciDevice->EnableBusMaster ||
-        (DeviceExtension->PciDevice->PciConfig.Command & PCI_ENABLE_BUS_MASTER) ||
-        PCI_CONFIGURATION_TYPE(&DeviceExtension->PciDevice->PciConfig) != PCI_DEVICE_TYPE ||
-        UsingMsi || UsingMsix)
-    {
-        Command |= PCI_ENABLE_BUS_MASTER;
-        DBGPRINT("[Bus master] ");
-    }
+    Command |= PCI_ENABLE_BUS_MASTER;
+    DBGPRINT("[Bus master] ");
 
     if (HasMemResource ||
         DeviceExtension->PciDevice->EnableMemorySpace ||
@@ -5920,6 +5912,14 @@ PdoStartDevice(
                                   &Command,
                                   FIELD_OFFSET(PCI_COMMON_CONFIG, Command),
                                   sizeof(USHORT));
+        /* TEMPORARY Surface diag: remove before commit */
+        DPRINT1("pci diag: started %04x:%04x bus %lu slot 0x%lx command 0x%04x (was 0x%04x)\n",
+                DeviceExtension->PciDevice->PciConfig.VendorID,
+                DeviceExtension->PciDevice->PciConfig.DeviceID,
+                DeviceExtension->PciDevice->BusNumber,
+                DeviceExtension->PciDevice->SlotNumber.u.AsULONG,
+                Command,
+                DeviceExtension->PciDevice->PciConfig.Command);
     }
     else
     {

@@ -1304,6 +1304,17 @@ Return Value:
 
         m_Connected = TRUE;
 
+        /* TEMPORARY Surface diag: remove before commit */
+        DbgPrint("wdf diag: %s connected interrupt %p vector 0x%lx irql %u mode %u shared %u msg %u passive %u\n",
+                 pFxDriverGlobals->Public.DriverName,
+                 this,
+                 m_InterruptInfo.Vector,
+                 (ULONG)m_InterruptInfo.Irql,
+                 (ULONG)m_InterruptInfo.Mode,
+                 m_InterruptInfo.ShareDisposition == CmResourceShareShared ? 1 : 0,
+                 (ULONG)m_InterruptInfo.MessageSignaled,
+                 m_PassiveHandling ? 1 : 0);
+
 #if FX_IS_KERNEL_MODE
         m_Active = TRUE;
 #endif

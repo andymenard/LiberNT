@@ -371,6 +371,19 @@ Return Value:
                                 interrupt->m_InterruptInfo.MessageNumber);
     }
 
+    /* TEMPORARY Surface diag: remove before commit */
+    {
+        static LONG DiagCalls[256], DiagClaimed[256];
+        ULONG v = interrupt->m_InterruptInfo.Vector & 0xFF;
+        LONG n = InterlockedIncrement(&DiagCalls[v]);
+
+        if (result)
+            InterlockedIncrement(&DiagClaimed[v]);
+        if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000)
+            DbgPrint("wdf diag: interrupt %p vector 0x%lx called %ld times, claimed %ld\n",
+                     interrupt, interrupt->m_InterruptInfo.Vector, n, DiagClaimed[v]);
+    }
+
     return result;
 }
 

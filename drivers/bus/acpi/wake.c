@@ -145,6 +145,67 @@ AcpiWakeSystemState(
     return (SYSTEM_POWER_STATE)(PowerSystemSleeping1 + SleepState - 1);
 }
 
+static
+BOOLEAN
+AcpiWakeHasWakeInterrupt(
+    _In_ struct acpi_device *Device)
+{
+    ACPI_BUFFER Buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+    ACPI_RESOURCE *Resource;
+    BOOLEAN Found = FALSE;
+
+    if (ACPI_FAILURE(AcpiGetCurrentResources(Device->handle, &Buffer)) || Buffer.Pointer == NULL)
+        return FALSE;
+
+    for (Resource = Buffer.Pointer;
+         !Found && Resource->Type != ACPI_RESOURCE_TYPE_END_TAG;
+         Resource = ACPI_NEXT_RESOURCE(Resource))
+    {
+        switch (Resource->Type)
+        {
+            case ACPI_RESOURCE_TYPE_IRQ:
+                Found = (Resource->Data.Irq.WakeCapable == ACPI_WAKE_CAPABLE);
+                break;
+
+            case ACPI_RESOURCE_TYPE_EXTENDED_IRQ:
+                Found = (Resource->Data.ExtendedIrq.WakeCapable == ACPI_WAKE_CAPABLE);
+                break;
+
+            case ACPI_RESOURCE_TYPE_GPIO:
+                Found = (Resource->Data.Gpio.ConnectionType == ACPI_RESOURCE_GPIO_TYPE_INT &&
+                         Resource->Data.Gpio.WakeCapable == ACPI_WAKE_CAPABLE);
+                break;
+        }
+    }
+
+    AcpiOsFree(Buffer.Pointer);
+    return Found;
+}
+
+static
+VOID
+AcpiWakeQueryInterruptCapabilities(
+    _In_ struct acpi_device *Device,
+    _Inout_ PDEVICE_CAPABILITIES Capabilities)
+{
+    unsigned long long Value;
+
+    if (ACPI_FAILURE(acpi_evaluate_integer(Device->handle, "_S0W", NULL, &Value)) ||
+        Value == ACPI_STATE_D0 ||
+        !AcpiWakeHasWakeInterrupt(Device))
+    {
+        return;
+    }
+
+    /* TODO: complete IRP_MN_WAIT_WAKE for devices that wake through a wake-capable interrupt */
+    Capabilities->SystemWake = PowerSystemWorking;
+    Capabilities->DeviceWake = (DEVICE_POWER_STATE)(PowerDeviceD0 + min(Value, (unsigned long long)ACPI_STATE_D3_HOT));
+    Capabilities->WakeFromD0 = TRUE;
+    Capabilities->WakeFromD1 = Capabilities->DeviceWake >= PowerDeviceD1;
+    Capabilities->WakeFromD2 = Capabilities->DeviceWake >= PowerDeviceD2;
+    Capabilities->WakeFromD3 = Capabilities->DeviceWake >= PowerDeviceD3;
+}
+
 VOID
 AcpiWakeQueryCapabilities(
     _In_ struct acpi_device *Device,
@@ -173,9 +234,12 @@ AcpiWakeQueryCapabilities(
     Capabilities->DeviceWake = PowerDeviceUnspecified;
 
     if (!Device->wakeup.flags.valid)
+    {
+        AcpiWakeQueryInterruptCapabilities(Device, Capabilities);
         return;
+    }
 
-    SleepState = (ULONG)min(Device->wakeup.sleep_state, (ACPI_INTEGER)ACPI_STATE_S4);
+    SleepState =(ULONG)min(Device->wakeup.sleep_state, (ACPI_INTEGER)ACPI_STATE_S4);
     Capabilities->SystemWake = AcpiWakeSystemState(Device);
     if (SleepState == ACPI_STATE_S0)
     {

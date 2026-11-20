@@ -7557,9 +7557,11 @@ XHCI_HandlePortChange(
     if (PortScReg)
         PortSc = XHCI_READ_REGISTER_ULONG(PortScReg);
 
-    DPRINT("usbxhci: port status change on port %u PortSC=0x%08lx\n",
-           PortId,
-           PortSc);
+    /* TEMPORARY Surface USB 2 diag: remove before commit */
+    DPRINT1("usbxhci diag: port %u usb%u change PORTSC=0x%08lx\n",
+            PortId,
+            Extension->PortProtocol[PortId],
+            PortSc);
 
     /*
      * Record the detach, but do not issue Disable Slot from this event-ring/DPC
@@ -14796,6 +14798,21 @@ XHCI_StartController(PVOID MiniPortExtension,
         DPRINT("usbxhci: raised system timer resolution to %lu*100ns "
                "(target 10000) for poll-fallback quirk\n",
                Achieved);
+    }
+
+    /* TEMPORARY Surface USB 2 diag: remove before commit */
+    {
+        USHORT DiagPort;
+
+        DPRINT1("usbxhci diag: %u ports, %u protocol segment(s), debugger share %u port %lu\n",
+                Extension->NumberOfPorts, Extension->ProtocolSegmentCount,
+                Extension->DebugShare ? 1 : 0, Extension->DebugShareInfo.Port);
+        for (DiagPort = 1; DiagPort <= Extension->NumberOfPorts && DiagPort <= XHCI_MAX_PORTS; DiagPort++)
+        {
+            DPRINT1("usbxhci diag: start port %u usb%u PORTSC=0x%08lx\n",
+                    DiagPort, Extension->PortProtocol[DiagPort],
+                    XHCI_READ_REGISTER_ULONG(&Extension->OperationalRegisters->PortRegister[DiagPort - 1].PortStatusAndControl));
+        }
     }
 
     return MP_STATUS_SUCCESS;

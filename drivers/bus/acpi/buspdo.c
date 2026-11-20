@@ -1861,8 +1861,10 @@ BuspCreateRequirementsListFromAcpiResources(
                             resource->Data.Gpio.Shareable == ACPI_SHARED ?
                             CmResourceShareShared : CmResourceShareDeviceExclusive;
                         RequirementDescriptor->Flags =
-                            resource->Data.Gpio.Triggering == ACPI_LEVEL_SENSITIVE ?
-                            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE : CM_RESOURCE_INTERRUPT_LATCHED;
+                            (resource->Data.Gpio.Triggering == ACPI_LEVEL_SENSITIVE ?
+                             CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE : CM_RESOURCE_INTERRUPT_LATCHED) |
+                            (resource->Data.Gpio.WakeCapable == ACPI_WAKE_CAPABLE ?
+                             CM_RESOURCE_INTERRUPT_WAKE_HINT : 0);
                         RequirementDescriptor->u.Interrupt.MinimumVector =
                         RequirementDescriptor->u.Interrupt.MaximumVector = Gsiv;
                         RequirementDescriptor++;
@@ -2684,8 +2686,10 @@ BuspCreateResourceListFromAcpiResources(
                             resource->Data.Gpio.Shareable == ACPI_SHARED ?
                             CmResourceShareShared : CmResourceShareDeviceExclusive;
                         ResourceDescriptor->Flags =
-                            resource->Data.Gpio.Triggering == ACPI_LEVEL_SENSITIVE ?
-                            CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE : CM_RESOURCE_INTERRUPT_LATCHED;
+                            (resource->Data.Gpio.Triggering == ACPI_LEVEL_SENSITIVE ?
+                             CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE : CM_RESOURCE_INTERRUPT_LATCHED) |
+                            (resource->Data.Gpio.WakeCapable == ACPI_WAKE_CAPABLE ?
+                             CM_RESOURCE_INTERRUPT_WAKE_HINT : 0);
                         ResourceDescriptor->u.Interrupt.Level =
                         ResourceDescriptor->u.Interrupt.Vector = Gsiv;
                         ResourceDescriptor->u.Interrupt.Affinity = (KAFFINITY)(-1);

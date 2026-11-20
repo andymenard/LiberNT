@@ -333,6 +333,63 @@ FwGetBootPartition(
     return FALSE;
 }
 
+static
+SIZE_T
+FwDevicePathSize(
+    _In_ EFI_DEVICE_PATH_PROTOCOL* DevicePath)
+{
+    EFI_DEVICE_PATH_PROTOCOL* Node;
+
+    for (Node = DevicePath; !IsDevicePathEnd(Node); Node = NextDevicePathNode(Node))
+        ;
+
+    return (PUCHAR)Node - (PUCHAR)DevicePath;
+}
+
+/*
+ * Some firmware, such as the Microsoft (Project Mu) firmware of Surface devices, does not start
+ * an image loaded from memory without a device path. Describe the image as coming from the boot
+ * manager's own file; the firmware only uses the path to identify the image and reads the buffer.
+ */
+static
+EFI_DEVICE_PATH_PROTOCOL*
+FwBuildSourcePath(VOID)
+{
+    EFI_BOOT_SERVICES* BootServices = GlobalSystemTable->BootServices;
+    EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
+    EFI_DEVICE_PATH_PROTOCOL *DevicePath, *End;
+    SIZE_T DeviceSize, FileSize;
+    PUCHAR Buffer;
+
+    if (EFI_ERROR(BootServices->HandleProtocol(GlobalImageHandle,
+                                               &FwLoadedImageProtocolGuid,
+                                               (VOID**)&LoadedImage)) ||
+        !LoadedImage->DeviceHandle ||
+        !LoadedImage->FilePath ||
+        EFI_ERROR(BootServices->HandleProtocol(LoadedImage->DeviceHandle,
+                                               &FwDevicePathGuid,
+                                               (VOID**)&DevicePath)))
+    {
+        return NULL;
+    }
+
+    DeviceSize = FwDevicePathSize(DevicePath);
+    FileSize = FwDevicePathSize(LoadedImage->FilePath);
+    Buffer = FwAllocate(DeviceSize + FileSize + sizeof(EFI_DEVICE_PATH_PROTOCOL));
+    if (!Buffer)
+        return NULL;
+
+    RtlCopyMemory(Buffer, DevicePath, DeviceSize);
+    RtlCopyMemory(Buffer + DeviceSize, LoadedImage->FilePath, FileSize);
+
+    End = (EFI_DEVICE_PATH_PROTOCOL*)(Buffer + DeviceSize + FileSize);
+    End->Type = END_DEVICE_PATH_TYPE;
+    End->SubType = END_ENTIRE_DEVICE_PATH_SUBTYPE;
+    End->Length[0] = sizeof(EFI_DEVICE_PATH_PROTOCOL);
+    End->Length[1] = 0;
+    return (EFI_DEVICE_PATH_PROTOCOL*)Buffer;
+}
+
 BOOLEAN
 FwStartImage(
     _In_reads_bytes_(Size) PVOID Image,
@@ -342,13 +399,34 @@ FwStartImage(
 {
     EFI_BOOT_SERVICES* BootServices = GlobalSystemTable->BootServices;
     EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
-    EFI_HANDLE Handle;
+    EFI_DEVICE_PATH_PROTOCOL* SourcePath;
+    EFI_HANDLE Handle = NULL;
     EFI_STATUS Status;
 
     *Cancelled = FALSE;
 
-    if (EFI_ERROR(BootServices->LoadImage(FALSE, GlobalImageHandle, NULL, Image, Size, &Handle)))
+    SourcePath = FwBuildSourcePath();
+    Status = BootServices->LoadImage(FALSE, GlobalImageHandle, SourcePath, Image, Size, &Handle);
+    DbgPrint("Boot manager: LoadImage of %lu bytes %s a source path returned %p\n",
+             Size, SourcePath ? "with" : "without", (PVOID)Status);
+    if (EFI_ERROR(Status) && SourcePath)
+    {
+        if (Handle)
+            BootServices->UnloadImage(Handle);
+        Handle = NULL;
+        Status = BootServices->LoadImage(FALSE, GlobalImageHandle, NULL, Image, Size, &Handle);
+        DbgPrint("Boot manager: LoadImage without a source path returned %p\n", (PVOID)Status);
+    }
+    if (SourcePath)
+        FwFree(SourcePath);
+
+    if (EFI_ERROR(Status))
+    {
+        /* On a security violation the image is loaded but must not be started */
+        if (Handle)
+            BootServices->UnloadImage(Handle);
         return FALSE;
+    }
 
     if (EFI_ERROR(BootServices->HandleProtocol(Handle,
                                                &FwLoadedImageProtocolGuid,
@@ -365,6 +443,7 @@ FwStartImage(
     BootLogClose();
     Status = BootServices->StartImage(Handle, NULL, NULL);
     UdpLogOpen();
+    DbgPrint("Boot manager: StartImage returned %p\n", (PVOID)Status);
     *Cancelled = (Status == EFI_ABORTED);
     return !EFI_ERROR(Status);
 }

@@ -83,6 +83,8 @@ typedef struct _SERCX2_DEVICE_CONTEXT
     BOOLEAN HasRequestAttributes;
     BOOLEAN Initialized;
     BOOLEAN Opened;
+    BOOLEAN HasConnectionId;
+    LARGE_INTEGER ConnectionId;
     WDFQUEUE Queue;
     WDFQUEUE WriteQueue;
     WDFQUEUE ReadQueue;
@@ -195,6 +197,7 @@ SerCx2CompleteTransaction(
             Pio->Config.EvtSerCx2PioReceiveCleanupTransaction(Device->PioReceive);
     }
 
+    DPRINT1("SerCx2 diag: PIO %s done 0x%08lx, %Iu bytes\n", Transaction == &Device->Tx ? "write" : "read", Status, Information);
     WdfRequestCompleteWithInformation(Request, Status, Information);
 }
 
@@ -751,6 +754,7 @@ SerCx2NonPioFinish(
 
     if (Transaction->Type == SerCx2TransactionTypeSystemDma)
         (VOID)!WdfRequestUnmarkCancelable(Request);
+    DPRINT1("SerCx2 diag: type %d %s done 0x%08lx, %Iu bytes\n", Transaction->Type, Transaction == &Device->Rx ? "read" : "write", Status, Information);
     WdfRequestCompleteWithInformation(Request, Status, Information);
     SerCx2NonPioRequestDone(Device, Transaction);
 }
@@ -768,6 +772,7 @@ SerCx2EvtRequestCleanup(
 
     if (Context == NULL || Context->CustomDevice == NULL)
         return;
+    DPRINT1("SerCx2 diag: custom %s request %p cleaned up\n", Context->CustomReceive ? "rx" : "tx", Object);
     Device = SerCx2GetDeviceContext(Context->CustomDevice);
     Transaction = Context->CustomReceive ? &Device->Rx : &Device->Tx;
     Context->CustomDevice = NULL;
@@ -931,6 +936,7 @@ SerCx2CustomStart(
 
     RequestContext->CustomDevice = SerCx2DeviceHandle(Device);
     RequestContext->CustomReceive = Receive;
+    DPRINT1("SerCx2 diag: custom %s start, request %p, %lu bytes\n", Receive ? "rx" : "tx", Request, Length);
     if (Receive)
     {
         Custom->RxConfig.EvtSerCx2CustomReceiveTransactionStart((SERCX2CUSTOMRECEIVETRANSACTION)Handle, Request,
@@ -960,6 +966,7 @@ SerCx2NonPioInitialized(
     KeAcquireSpinLock(&Device->Lock, &OldIrql);
     Active = Transaction->Request != NULL && Transaction->Type != SerCx2TransactionTypePio && !Transaction->Cleaning;
     KeReleaseSpinLock(&Device->Lock, OldIrql);
+    DPRINT1("SerCx2 diag: %s initialized 0x%08lx, active %u\n", Transaction == &Device->Rx ? "rx" : "tx", Status, Active);
     if (!Active)
         return;
 
@@ -983,6 +990,8 @@ SerCx2NonPioBegin(
     BOOLEAN Receive = Transaction == &Device->Rx;
     ULONG Length = (ULONG)min(Transaction->Length, MAXULONG);
 
+    DPRINT1("SerCx2 diag: non-PIO %s begin, type %d, %lu bytes\n", Receive ? "rx" : "tx", Transaction->Type, Length);
+
     if (Transaction->Type == SerCx2TransactionTypeSystemDma)
     {
         PSERCX2_SYSTEM_DMA_CONTEXT Dma = SerCx2DmaFor(Device, Receive);
@@ -1003,6 +1012,9 @@ SerCx2NonPioBegin(
         WDFOBJECT Handle;
         PSERCX2_CUSTOM_TRANSACTION_CONTEXT Custom = SerCx2CustomFor(Device, Receive, &Handle);
 
+        DPRINT1("SerCx2 diag: custom %p, rx init %p, tx init %p\n", Custom,
+                Custom != NULL ? (PVOID)Custom->RxConfig.EvtSerCx2CustomReceiveTransactionInitialize : NULL,
+                Custom != NULL ? (PVOID)Custom->TxConfig.EvtSerCx2CustomTransmitTransactionInitialize : NULL);
         if (Custom != NULL && Receive && Custom->RxConfig.EvtSerCx2CustomReceiveTransactionInitialize != NULL)
         {
             Custom->RxConfig.EvtSerCx2CustomReceiveTransactionInitialize((SERCX2CUSTOMRECEIVETRANSACTION)Handle,
@@ -1111,6 +1123,7 @@ SerCx2TxStartNext(
             Mdl = NULL;
 
         Type = SerCx2SelectType(Device, Mdl, Buffer, (ULONG)min(Length, MAXULONG), FALSE);
+        DPRINT1("SerCx2 diag: tx type %d, %Iu bytes, mdl %p\n", Type, Length, Mdl);
         KeAcquireSpinLock(&Device->Lock, &OldIrql);
         RtlZeroMemory(&Device->Tx, sizeof(Device->Tx));
         Device->Tx.Request = Request;
@@ -1220,6 +1233,7 @@ SerCx2TxRun(
                                                               Device->Tx.Buffer + Device->Tx.Offset,
                                                               (ULONG)min(Remaining, MAXULONG));
         Device->Tx.Offset += min(Written, Remaining);
+        DPRINT1("SerCx2 diag: tx wrote %lu, offset %Iu of %Iu\n", Written, Device->Tx.Offset, Device->Tx.Length);
 
         if (Device->Tx.Offset >= Device->Tx.Length)
         {
@@ -1231,6 +1245,7 @@ SerCx2TxRun(
                     SerCx2CompleteTransaction(Device, &Device->Tx, AbortRequest, STATUS_CANCELLED, AbortOffset);
                     continue;
                 }
+                DPRINT1("SerCx2 diag: tx drain fifo\n");
                 Pio->Config.EvtSerCx2PioTransmitDrainFifo(Device->PioTransmit);
             }
             else
@@ -1249,6 +1264,7 @@ SerCx2TxRun(
                 SerCx2CompleteTransaction(Device, &Device->Tx, AbortRequest, STATUS_CANCELLED, AbortOffset);
                 continue;
             }
+            DPRINT1("SerCx2 diag: tx enable ready notification\n");
             Pio->Config.EvtSerCx2PioTransmitEnableReadyNotification(Device->PioTransmit);
         }
 
@@ -1309,6 +1325,7 @@ SerCx2RxStartNext(
             Mdl = NULL;
 
         Type = SerCx2SelectType(Device, Mdl, Buffer, (ULONG)min(Length, MAXULONG), TRUE);
+        DPRINT1("SerCx2 diag: rx type %d, %Iu bytes, mdl %p\n", Type, Length, Mdl);
         KeAcquireSpinLock(&Device->Lock, &OldIrql);
         RtlZeroMemory(&Device->Rx, sizeof(Device->Rx));
         Device->Rx.Request = Request;
@@ -1479,7 +1496,7 @@ SerCx2EvtIoWrite(
     PSERCX2_DEVICE_CONTEXT Device = SerCx2GetDeviceContext(DeviceHandle);
     NTSTATUS Status;
 
-    UNREFERENCED_PARAMETER(Length);
+    DPRINT1("SerCx2 diag: write %Iu bytes\n", Length);
 
     if (Device->PioTransmit == NULL)
     {
@@ -1511,7 +1528,7 @@ SerCx2EvtIoRead(
     PSERCX2_DEVICE_CONTEXT Device = SerCx2GetDeviceContext(DeviceHandle);
     NTSTATUS Status;
 
-    UNREFERENCED_PARAMETER(Length);
+    DPRINT1("SerCx2 diag: read %Iu bytes\n", Length);
 
     if (Device->PioReceive == NULL)
     {
@@ -1586,6 +1603,30 @@ SerCx2Purge(
 }
 
 static
+NTSTATUS
+SerCx2ApplyConnectionConfig(
+    _In_ WDFDEVICE DeviceHandle,
+    _In_ PSERCX2_DEVICE_CONTEXT Device)
+{
+    PRH_QUERY_CONNECTION_PROPERTIES_OUTPUT_BUFFER Properties = NULL;
+    NTSTATUS Status;
+
+    if (!Device->HasConnectionId)
+        return STATUS_INVALID_DEVICE_REQUEST;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    Status = WdfCxQueryConnectionProperties(Device->ConnectionId, &Properties);
+    if (NT_SUCCESS(Status) && Device->Config.EvtSerCx2ApplyConfig != NULL)
+        Status = Device->Config.EvtSerCx2ApplyConfig(DeviceHandle, Properties);
+    if (Properties != NULL)
+        ExFreePoolWithTag(Properties, WDFCX_TAG);
+
+    return Status;
+}
+
+static
 VOID
 NTAPI
 SerCx2EvtIoDeviceControl(
@@ -1601,6 +1642,8 @@ SerCx2EvtIoDeviceControl(
     PVOID Buffer;
     ULONG Value;
     NTSTATUS Status;
+
+    DPRINT1("SerCx2 diag: ioctl 0x%08lx in %Iu out %Iu\n", IoControlCode, InputBufferLength, OutputBufferLength);
 
     Status = SerCx2PrepareRequest(Device, Request);
     if (!NT_SUCCESS(Status))
@@ -1701,6 +1744,10 @@ SerCx2EvtIoDeviceControl(
             Status = STATUS_SUCCESS;
             break;
 
+        case IOCTL_SERIAL_APPLY_DEFAULT_CONFIGURATION:
+            Status = SerCx2ApplyConnectionConfig(DeviceHandle, Device);
+            break;
+
         default:
             if (Device->Config.EvtSerCx2Control != NULL)
             {
@@ -1739,8 +1786,6 @@ SerCx2EvtCxDeviceFileCreate(
     _In_opt_ WDFFILEOBJECT FileObject)
 {
     PSERCX2_DEVICE_CONTEXT Device = SerCx2GetDeviceContext(DeviceHandle);
-    PRH_QUERY_CONNECTION_PROPERTIES_OUTPUT_BUFFER Properties = NULL;
-    LARGE_INTEGER ConnectionId;
     KIRQL OldIrql;
     NTSTATUS Status = STATUS_SUCCESS;
 
@@ -1762,14 +1807,9 @@ SerCx2EvtCxDeviceFileCreate(
     RtlZeroMemory(&Device->Timeouts, sizeof(Device->Timeouts));
     KeReleaseSpinLock(&Device->Lock, OldIrql);
 
-    if (WdfCxParseConnectionId(WdfFileObjectGetFileName(FileObject), &ConnectionId))
-    {
-        Status = WdfCxQueryConnectionProperties(ConnectionId, &Properties);
-        if (NT_SUCCESS(Status) && Device->Config.EvtSerCx2ApplyConfig != NULL)
-            Status = Device->Config.EvtSerCx2ApplyConfig(DeviceHandle, Properties);
-        if (Properties != NULL)
-            ExFreePoolWithTag(Properties, WDFCX_TAG);
-    }
+    Device->HasConnectionId = WdfCxParseConnectionId(WdfFileObjectGetFileName(FileObject), &Device->ConnectionId);
+    if (Device->HasConnectionId)
+        Status = SerCx2ApplyConnectionConfig(DeviceHandle, Device);
 
     if (NT_SUCCESS(Status) && Device->Config.EvtSerCx2FileOpen != NULL)
         Status = Device->Config.EvtSerCx2FileOpen(DeviceHandle);
@@ -2101,6 +2141,7 @@ SerCx2DdiPioTransmitReady(
     PSERCX2_PIO_TRANSMIT_CONTEXT Context = SerCx2GetPioTransmitContext(Object);
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    DPRINT1("SerCx2 diag: PIO transmit ready\n");
     if (Context != NULL)
         SerCx2TxRun(Context->Device);
 }
@@ -2115,6 +2156,7 @@ SerCx2DdiPioReceiveReady(
     PSERCX2_PIO_RECEIVE_CONTEXT Context = SerCx2GetPioReceiveContext(Object);
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    DPRINT1("SerCx2 diag: PIO receive ready\n");
     if (Context != NULL)
         SerCx2RxRun(Context->Device);
 }
@@ -2129,6 +2171,7 @@ SerCx2DdiPioTransmitDrainFifoComplete(
     PSERCX2_PIO_TRANSMIT_CONTEXT Context = SerCx2GetPioTransmitContext(Object);
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    DPRINT1("SerCx2 diag: tx drain fifo complete\n");
     if (Context != NULL)
         SerCx2TxRun(Context->Device);
 }
@@ -2154,6 +2197,7 @@ SerCx2DdiPioTransmitInitializeTransactionComplete(
     _In_ SERCX2PIOTRANSMIT PioTransmit,
     _In_ BOOLEAN InitSuccess)
 {
+    DPRINT1("SerCx2 diag: tx initialize complete %u\n", InitSuccess);
     UNREFERENCED_PARAMETER(ClientGlobals);
     UNREFERENCED_PARAMETER(PioTransmit);
     UNREFERENCED_PARAMETER(InitSuccess);
@@ -2167,6 +2211,7 @@ SerCx2DdiPioReceiveInitializeTransactionComplete(
     _In_ SERCX2PIORECEIVE PioReceive,
     _In_ BOOLEAN InitSuccess)
 {
+    DPRINT1("SerCx2 diag: rx initialize complete %u\n", InitSuccess);
     UNREFERENCED_PARAMETER(ClientGlobals);
     UNREFERENCED_PARAMETER(PioReceive);
     UNREFERENCED_PARAMETER(InitSuccess);
@@ -2643,6 +2688,7 @@ SerCx2DdiCustomTransactionInitializeComplete(
     PSERCX2_TRANSACTION Transaction = SerCx2CustomTransactionFor(Object, &Device);
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    DPRINT1("SerCx2 diag: custom initialize complete %p, success %u\n", Object, InitSuccess);
     /* FIXME: the status of a request whose transaction failed to initialize is not documented */
     if (Transaction != NULL)
         SerCx2NonPioInitialized(Device, Transaction, InitSuccess ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR);
@@ -2675,6 +2721,7 @@ SerCx2DdiCustomReceiveTransactionNewDataNotification(
     KIRQL OldIrql;
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    DPRINT1("SerCx2 diag: custom rx new data\n");
     if (Transaction == NULL)
         return;
     KeAcquireSpinLock(&Device->Lock, &OldIrql);
@@ -2698,6 +2745,13 @@ SerCx2DdiCustomReceiveTransactionReportProgress(
     KIRQL OldIrql;
 
     UNREFERENCED_PARAMETER(ClientGlobals);
+    {
+        static LONG DiagProgressCalls;
+        LONG Calls = InterlockedIncrement(&DiagProgressCalls);
+
+        if (Calls <= 3 || Calls % 1000 == 0)
+            DPRINT1("SerCx2 diag: custom rx progress %d (call %ld)\n", Progress, Calls);
+    }
     if (Transaction == NULL)
         return;
 

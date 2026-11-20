@@ -501,6 +501,15 @@ Exit:
         RtlFreeUnicodeString(&libraryServicePath);
     }
 
+    /* TEMPORARY Surface diag: remove before commit */
+    DbgPrint("wdfldr diag: bind %wZ to %ws %lu.%lu.%lu -> 0x%08lx\n",
+             ServicePath,
+             BindInfo ? BindInfo->Component : NULL,
+             BindInfo ? BindInfo->Version.Major : 0,
+             BindInfo ? BindInfo->Version.Minor : 0,
+             BindInfo ? BindInfo->Version.Build : 0,
+             status);
+
     DPRINT_TRACE_EXIT();
     return status;
 }
