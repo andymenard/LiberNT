@@ -571,6 +571,11 @@ CmpFindDrivers(
     PCM_KEY_NODE DriverNode;
     HCELL_INDEX ServicesCell;
     HCELL_INDEX DriverCell;
+    UNICODE_STRING ControlName = RTL_CONSTANT_STRING(L"Control");
+    PCM_KEY_NODE ControlKeyNode;
+    HCELL_INDEX ControlKeyCell;
+    ULONG BootDriverFlags = 0;
+    ULONG BootFlags;
     ULONG Start;
     ULONG Type;
     ULONG i;
@@ -579,6 +584,25 @@ CmpFindDrivers(
     if (ControlNode == NULL) return FALSE;
 
     ServicesCell = CmpFindSubKeyByName(Hive, ControlNode, &ServicesName);
+
+    /*
+     * Control\BootDriverFlags names the boot scenarios (USB disk, network...)
+     * this system may boot in. A demand-start service whose BootFlags share a
+     * scenario bit is promoted to the boot list, as the Windows loader does:
+     * this is how the UAS driver gets loaded for a USB Attached SCSI boot disk.
+     */
+    ControlKeyCell = CmpFindSubKeyByName(Hive, ControlNode, &ControlName);
+    if (ControlKeyCell != HCELL_NIL)
+    {
+        ControlKeyNode = (PCM_KEY_NODE)HvGetCell(Hive, ControlKeyCell);
+        if (ControlKeyNode != NULL)
+        {
+            if (!CmpReadDword(Hive, ControlKeyNode, L"BootDriverFlags", &BootDriverFlags))
+                BootDriverFlags = 0;
+            HvReleaseCell(Hive, ControlKeyCell);
+        }
+    }
+    BootDriverFlags &= CM_SERVICE_VALID_PROMOTION_MASK;
     HvReleaseCell(Hive, ControlSet);
 
     if (ServicesCell == HCELL_NIL) return FALSE;
@@ -599,6 +623,16 @@ CmpFindDrivers(
         {
             HvReleaseCell(Hive, DriverCell);
             continue;
+        }
+
+        if (LoadType == BootLoad &&
+            Start != (ULONG)BootLoad &&
+            Start != SERVICE_DISABLED &&
+            BootDriverFlags != 0 &&
+            CmpReadDword(Hive, DriverNode, L"BootFlags", &BootFlags) &&
+            (BootFlags & BootDriverFlags) != 0)
+        {
+            Start = (ULONG)BootLoad;
         }
 
         HvReleaseCell(Hive, DriverCell);

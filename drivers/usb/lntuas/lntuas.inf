@@ -47,6 +47,8 @@ AddReg         = lntuas_Service_AddReg
 
 [lntuas_Service_AddReg]
 HKR, "Parameters", "BusType", %REG_DWORD%, 0x00000007
+; Promoted to the boot list when the system boots from a USB disk (Control\BootDriverFlags)
+HKR, , "BootFlags", %REG_DWORD%, 0x00000014
 
 [lntuas_CopyFiles]
 lntuas.sys,,,1

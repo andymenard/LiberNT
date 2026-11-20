@@ -2112,6 +2112,15 @@ HKLM,"SYSTEM\CurrentControlSet\Services\usbehci","ImagePath",0x00020000,"system3
 HKLM,"SYSTEM\CurrentControlSet\Services\usbehci","Start",0x00010001,0x00000003
 HKLM,"SYSTEM\CurrentControlSet\Services\usbehci","Type",0x00010001,0x00000001
 
+; USB Attached SCSI: demand-start, promoted to the boot list for a USB disk boot by BootFlags
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","BootFlags",0x00010001,0x00000014
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","ErrorControl",0x00010001,0x00000001
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","Group",0x00000000,"SCSI Miniport"
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","ImagePath",0x00020000,"system32\drivers\lntuas.sys"
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","Start",0x00010001,0x00000003
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas","Type",0x00010001,0x00000001
+HKLM,"SYSTEM\CurrentControlSet\Services\lntuas\Parameters","BusType",0x00010001,0x00000007
+
 ; USB storage driver
 HKLM,"SYSTEM\CurrentControlSet\Services\usbstor","BootFlags",0x00010001,0x00000014
 HKLM,"SYSTEM\CurrentControlSet\Services\usbstor","ErrorControl",0x00010001,0x00000001
