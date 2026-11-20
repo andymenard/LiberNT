@@ -773,7 +773,9 @@ SerCx2EvtRequestCleanup(
 
     if (Context == NULL || Context->CustomDevice == NULL)
         return;
-    DPRINT1("SerCx2 diag: custom %s request %p cleaned up\n", Context->CustomReceive ? "rx" : "tx", Object);
+    DPRINT1("SerCx2 diag: custom %s request %p cleaned up, completed 0x%08lx with %Iu bytes\n",
+            Context->CustomReceive ? "rx" : "tx", Object,
+            WdfRequestGetStatus((WDFREQUEST)Object), (size_t)WdfRequestGetInformation((WDFREQUEST)Object));
     Device = SerCx2GetDeviceContext(Context->CustomDevice);
     Transaction = Context->CustomReceive ? &Device->Rx : &Device->Tx;
     Context->CustomDevice = NULL;
