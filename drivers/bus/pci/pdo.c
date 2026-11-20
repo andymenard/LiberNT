@@ -5559,14 +5559,13 @@ PciDiagLpssDumpThread(
     PHYSICAL_ADDRESS Bar;
     LARGE_INTEGER Interval;
     volatile ULONG *Regs;
+    ULONGLONG StartTime;
+    ULONG Dar, CtlHi, LastDar, LastCtlHi;
     ULONG Pass, Cmd = 0, Bar0 = 0, Bar1 = 0, Pm = 0;
     UCHAR PmCap = DeviceExtension->PciDevice->PmCapability;
 
     for (Pass = 0; Pass < RTL_NUMBER_OF(Delays); Pass++)
     {
-        Interval.QuadPart = -(LONGLONG)(Delays[Pass] - (Pass ? Delays[Pass - 1] : 0)) * 10000000LL;
-        if (Interval.QuadPart) KeDelayExecutionThread(KernelMode, FALSE, &Interval);
-
         PciPdoGetBusDataByOffset(DeviceExtension, &Cmd, 0x04, sizeof(Cmd));
         PciPdoGetBusDataByOffset(DeviceExtension, &Bar0, 0x10, sizeof(Bar0));
         PciPdoGetBusDataByOffset(DeviceExtension, &Bar1, 0x14, sizeof(Bar1));
@@ -5574,7 +5573,7 @@ PciDiagLpssDumpThread(
         DPRINT1("lpss diag: +%lus config cmd/status 0x%08lx bar0 0x%08lx bar1 0x%08lx pmcsr 0x%08lx (cap 0x%x)\n",
                 Delays[Pass], Cmd, Bar0, Bar1, Pm, PmCap);
         Bar.QuadPart = ((ULONGLONG)Bar1 << 32) | (Bar0 & ~0xFUL);
-        if (Bar.QuadPart == 0) continue;
+        if (Bar.QuadPart == 0) return;
 
         Regs = (volatile ULONG *)MmMapIoSpace(Bar, 0x1000, MmNonCached);
         if (!Regs)
@@ -5592,6 +5591,27 @@ PciDiagLpssDumpThread(
         DPRINT1("lpss diag: +%lus ch0 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx | ch1 sar 0x%08lx dar 0x%08lx ctl 0x%08lx%08lx cfg 0x%08lx%08lx\n",
                 Delays[Pass], R(0x800), R(0x808), R(0x81C), R(0x818), R(0x844), R(0x840),
                 R(0x858), R(0x860), R(0x874), R(0x870), R(0x89C), R(0x898));
+        if (Pass + 1 < RTL_NUMBER_OF(Delays))
+        {
+            LastDar = R(0x860);
+            LastCtlHi = R(0x874);
+            Interval.QuadPart = -10000LL;
+            StartTime = KeQueryInterruptTime();
+            while (KeQueryInterruptTime() - StartTime <
+                   (ULONGLONG)(Delays[Pass + 1] - Delays[Pass]) * 10000000ULL)
+            {
+                KeDelayExecutionThread(KernelMode, FALSE, &Interval);
+                Dar = R(0x860);
+                CtlHi = R(0x874);
+                if (Dar != LastDar || CtlHi != LastCtlHi)
+                {
+                    DPRINT1("lpss diag: rx DMA dar 0x%08lx -> 0x%08lx ctl_hi 0x%08lx -> 0x%08lx\n",
+                            LastDar, Dar, LastCtlHi, CtlHi);
+                    LastDar = Dar;
+                    LastCtlHi = CtlHi;
+                }
+            }
+        }
 #undef R
         MmUnmapIoSpace((PVOID)Regs, 0x1000);
     }
