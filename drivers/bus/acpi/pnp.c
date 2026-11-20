@@ -47,14 +47,77 @@ Bus_InvalidateUnreportedRelations(
         IoInvalidateDeviceRelations(FdoData->UnderlyingPDO, BusRelations);
 }
 
+typedef struct _ACPI_PENDING_PDO
+{
+    PPDO_DEVICE_DATA Pdo;
+    ACPI_OBJECT *Dependencies;
+    BOOLEAN Ready;
+} ACPI_PENDING_PDO, *PACPI_PENDING_PDO;
+
+static
+ACPI_OBJECT *
+Bus_GetDependencies(
+    _In_ PPDO_DEVICE_DATA Pdo)
+{
+    ACPI_BUFFER Buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+
+    if (!Pdo->AcpiHandle ||
+        ACPI_FAILURE(AcpiEvaluateObjectTyped(Pdo->AcpiHandle, "_DEP", NULL, &Buffer, ACPI_TYPE_PACKAGE)))
+        return NULL;
+
+    return Buffer.Pointer;
+}
+
+static
+VOID
+Bus_ApplyDependencyReadiness(
+    _Inout_updates_(Count) PACPI_PENDING_PDO Pending,
+    _In_ ULONG Count)
+{
+    BOOLEAN Changed;
+    ULONG Index, Dependency, Provider;
+
+    do
+    {
+        Changed = FALSE;
+        for (Index = 0; Index < Count; Index++)
+        {
+            const ACPI_OBJECT *Package = Pending[Index].Dependencies;
+
+            if (!Pending[Index].Ready || !Package)
+                continue;
+
+            for (Dependency = 0; Dependency < Package->Package.Count; Dependency++)
+            {
+                const ACPI_OBJECT *Reference = &Package->Package.Elements[Dependency];
+
+                if (Reference->Type != ACPI_TYPE_LOCAL_REFERENCE || !Reference->Reference.Handle)
+                    continue;
+
+                for (Provider = 0; Provider < Count; Provider++)
+                {
+                    if (!Pending[Provider].Ready &&
+                        Pending[Provider].Pdo->AcpiHandle == Reference->Reference.Handle)
+                        break;
+                }
+                if (Provider == Count)
+                    continue;
+
+                Pending[Index].Ready = FALSE;
+                Changed = TRUE;
+                break;
+            }
+        }
+    } while (Changed);
+}
+
 static
 VOID
 Bus_UpdateReportedPdos(
     PFDO_DEVICE_DATA FdoData)
 {
     PLIST_ENTRY Entry;
-    PPDO_DEVICE_DATA *Pending;
-    PBOOLEAN Ready;
+    PACPI_PENDING_PDO Pending;
     ULONG Count = 0;
     ULONG Index;
 
@@ -71,7 +134,7 @@ Bus_UpdateReportedPdos(
         return;
     }
 
-    Pending = ExAllocatePoolWithTag(PagedPool, Count * (sizeof(*Pending) + sizeof(*Ready)), 'IpcA');
+    Pending = ExAllocatePoolWithTag(PagedPool, Count * sizeof(*Pending), 'IpcA');
     if (!Pending)
     {
         for (Entry = FdoData->ListOfPDOs.Flink; Entry != &FdoData->ListOfPDOs; Entry = Entry->Flink)
@@ -79,30 +142,37 @@ Bus_UpdateReportedPdos(
         ExReleaseFastMutex(&FdoData->Mutex);
         return;
     }
-    Ready = (PBOOLEAN)&Pending[Count];
-
     Index = 0;
     for (Entry = FdoData->ListOfPDOs.Flink; Entry != &FdoData->ListOfPDOs && Index < Count; Entry = Entry->Flink)
     {
         PPDO_DEVICE_DATA PdoData = CONTAINING_RECORD(Entry, PDO_DEVICE_DATA, Link);
 
         if (!PdoData->Reported)
-            Pending[Index++] = PdoData;
+            Pending[Index++].Pdo = PdoData;
     }
     Count = Index;
     ExReleaseFastMutex(&FdoData->Mutex);
 
     for (Index = 0; Index < Count; Index++)
-        Ready[Index] = BuspAreConnectionControllersReady(Pending[Index]);
+    {
+        Pending[Index].Ready = BuspAreConnectionControllersReady(Pending[Index].Pdo);
+        Pending[Index].Dependencies = Bus_GetDependencies(Pending[Index].Pdo);
+    }
+    Bus_ApplyDependencyReadiness(Pending, Count);
 
     ExAcquireFastMutex(&FdoData->Mutex);
     for (Index = 0; Index < Count; Index++)
     {
-        if (Ready[Index])
-            Pending[Index]->Reported = TRUE;
+        if (Pending[Index].Ready)
+            Pending[Index].Pdo->Reported = TRUE;
     }
     ExReleaseFastMutex(&FdoData->Mutex);
 
+    for (Index = 0; Index < Count; Index++)
+    {
+        if (Pending[Index].Dependencies)
+            AcpiOsFree(Pending[Index].Dependencies);
+    }
     ExFreePoolWithTag(Pending, 'IpcA');
 }
 
@@ -179,6 +249,87 @@ Bus_UnregisterControllerNotifications(
 #pragma alloc_text (PAGE, Bus_SendIrpSynchronously)
 #endif
 
+static
+BOOLEAN
+Bus_HasPendingDependency(
+    _In_ const ACPI_OBJECT *Package,
+    _In_reads_(Count) PDEVICE_OBJECT *Objects,
+    _In_ ULONG Count,
+    _In_ ULONG Candidate)
+{
+    ULONG Index, Dependency;
+
+    for (Dependency = 0; Dependency < Package->Package.Count; Dependency++)
+    {
+        const ACPI_OBJECT *Reference = &Package->Package.Elements[Dependency];
+
+        if (Reference->Type != ACPI_TYPE_LOCAL_REFERENCE || !Reference->Reference.Handle)
+            continue;
+
+        for (Index = 0; Index < Count; Index++)
+        {
+            PPDO_DEVICE_DATA PdoData = Objects[Index]->DeviceExtension;
+
+            if (Index != Candidate && PdoData->AcpiHandle == Reference->Reference.Handle)
+                return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static
+VOID
+Bus_OrderChildRelations(
+    _Inout_updates_(Count) PDEVICE_OBJECT *Objects,
+    _In_ ULONG Count)
+{
+    ACPI_OBJECT **Packages;
+    ULONG Index, First, Candidate;
+
+    if (Count < 2)
+        return;
+
+    Packages = ExAllocatePoolZero(PagedPool, Count * sizeof(*Packages), 'IpcA');
+    if (!Packages)
+        return;
+
+    for (Index = 0; Index < Count; Index++)
+        Packages[Index] = Bus_GetDependencies(Objects[Index]->DeviceExtension);
+
+    for (First = 0; First < Count; First++)
+    {
+        PDEVICE_OBJECT Object;
+        ACPI_OBJECT *Package;
+
+        for (Candidate = First; Candidate < Count; Candidate++)
+        {
+            Package = Packages[Candidate];
+            if (!Package ||
+                !Bus_HasPendingDependency(Package, Objects + First, Count - First, Candidate - First))
+                break;
+        }
+
+        if (Candidate == Count)
+            break;
+        if (Candidate == First)
+            continue;
+
+        Object = Objects[Candidate];
+        RtlMoveMemory(Objects + First + 1, Objects + First, (Candidate - First) * sizeof(*Objects));
+        RtlMoveMemory(Packages + First + 1, Packages + First, (Candidate - First) * sizeof(*Packages));
+        Objects[First] = Object;
+        Packages[First] = Package;
+    }
+
+    for (Index = 0; Index < Count; Index++)
+    {
+        if (Packages[Index])
+            AcpiOsFree(Packages[Index]);
+    }
+    ExFreePoolWithTag(Packages, 'IpcA');
+}
+
 NTSTATUS
 Bus_QueryChildRelations(
     _In_ PFDO_DEVICE_DATA FdoData,
@@ -241,6 +392,7 @@ Bus_QueryChildRelations(
     ExReleaseFastMutex(&FdoData->Mutex);
 
     ASSERT(Relations->Count == PrevCount + Count);
+    Bus_OrderChildRelations(Relations->Objects + PrevCount, Count);
     if (OldRelations)
         ExFreePool(OldRelations);
     Irp->IoStatus.Information = (ULONG_PTR)Relations;
