@@ -276,6 +276,28 @@ KiDispatchException(
     ASSERT(ExceptionRecord != NULL);
     ASSERT(TrapFrame != NULL);
 
+    /*
+     * TEMPORARY Surface diag: remove before commit. A kernel NT_ASSERT logs
+     * where it fired and the raw stack, then continues past the INT 2Ch, so
+     * the message reaches lastboot.log instead of dying on a crash screen.
+     */
+    if (PreviousMode == KernelMode &&
+        ExceptionRecord->ExceptionCode == STATUS_ASSERTION_FAILURE)
+    {
+        static LONG DiagAssertions;
+        ULONG_PTR Rip = TrapFrame->Rip;
+
+        if (InterlockedIncrement(&DiagAssertions) <= 8)
+        {
+            DbgPrint("\n*** NT_ASSERT at %p, continuing (Surface diag)\n", (PVOID)Rip);
+            KeRosDumpStackFrames(&Rip, 1);
+            DbgPrint("*** raw stack at %p:\n", (PVOID)TrapFrame->Rsp);
+            KeRosDumpStackFrames((PULONG_PTR)TrapFrame->Rsp, 48);
+        }
+        TrapFrame->Rip += 2;
+        return;
+    }
+
     if ((PreviousMode == KernelMode) && (ExceptionRecord->ExceptionCode != STATUS_BREAKPOINT))
     {
         KiArchBootReadout(BootReadoutException,

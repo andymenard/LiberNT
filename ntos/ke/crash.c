@@ -832,6 +832,24 @@ KiReportBugCheck(
 
     /* The frozen processors go to the log only: the screen keeps the processor that stopped */
     KiReportFrozenProcessors();
+
+    /*
+     * TEMPORARY Surface diag: remove before commit. The frozen processors'
+     * traces push the report off the top of the screen, and a dump writer
+     * that hangs leaves nothing after them, so say the essentials again last.
+     */
+    _snprintf(Line,
+              sizeof(Line),
+              "\r\n=== STOP 0x%08lX (0x%p, 0x%p, 0x%p, 0x%p) on processor %lu ===\r\n",
+              BugCheckCode,
+              (PVOID)KiBugCheckData[1],
+              (PVOID)KiBugCheckData[2],
+              (PVOID)KiBugCheckData[3],
+              (PVOID)KiBugCheckData[4],
+              (ULONG)KeGetCurrentPrcb()->Number);
+    KiDisplayAndLogBugCheckString(Line);
+    if (Context != NULL)
+        KiReportBugCheckBackTrace("=== stopping processor backtrace ===\r\n", Context, TRUE);
 }
 
 /*

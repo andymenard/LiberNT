@@ -1016,9 +1016,18 @@ HalGetAdapter(IN PDEVICE_DESCRIPTION DeviceDescription,
      *   DeviceDescription->MaximumLength.
      */
     MaximumLength = DeviceDescription->MaximumLength & MAXLONG;
-    if ((DeviceDescription->ScatterGather) &&
+    /*
+     * A bus master that reaches every physical page needs no translation,
+     * whether it does scatter/gather or packet-based DMA through
+     * AllocateAdapterChannel, as on Windows. Giving a packet-based 64-bit
+     * master map registers sent it through the asynchronous bounce-buffer
+     * growth path (Marvell AVASTAR Wi-Fi of the Surface Laptop).
+     */
+    if (((DeviceDescription->ScatterGather) || (DeviceDescription->Master)) &&
         ((DeviceDescription->InterfaceType == Eisa) ||
-         (DeviceDescription->InterfaceType == PCIBus)) &&
+         (DeviceDescription->InterfaceType == PCIBus) ||
+         /* IoGetDmaAdapter callers may leave the bus to the PDO; a master there is PCI */
+         ((DeviceDescription->InterfaceType == InterfaceTypeUndefined) && (DeviceDescription->Master))) &&
         (HalpGetDeviceMaximumPhysicalAddress(DeviceDescription) >= HalpGetHighestPhysicalAddress()))
     {
         MapRegisters = 0;
