@@ -84,6 +84,7 @@ typedef struct _SERCX2_DEVICE_CONTEXT
     BOOLEAN Initialized;
     BOOLEAN Opened;
     BOOLEAN HoldsPower;
+    BOOLEAN RaisedTimerResolution;
     BOOLEAN HasConnectionId;
     LARGE_INTEGER ConnectionId;
     WDFQUEUE Queue;
@@ -1890,7 +1891,21 @@ SerCx2EvtCxDeviceFileCreate(
         Status = Device->Config.EvtSerCx2FileOpen(DeviceHandle);
 
     if (NT_SUCCESS(Status))
+    {
         Device->Opened = TRUE;
+        /*
+         * Clients such as the Surface serial hub set a read interval time-out
+         * of 1 ms and expect a read back within a couple of milliseconds of
+         * the last byte. The interval timer cannot fire faster than the
+         * system clock, which defaults to 15.6 ms, so run it at 1 ms while
+         * the port is open.
+         */
+        if (!Device->RaisedTimerResolution)
+        {
+            ExSetTimerResolution(10000, TRUE);
+            Device->RaisedTimerResolution = TRUE;
+        }
+    }
     else if (Device->HoldsPower)
     {
         Device->HoldsPower = FALSE;
@@ -1919,6 +1934,12 @@ SerCx2EvtFileClose(
     Device->Opened = FALSE;
     if (Device->Config.EvtSerCx2FileClose != NULL)
         Device->Config.EvtSerCx2FileClose(DeviceHandle);
+
+    if (Device->RaisedTimerResolution)
+    {
+        Device->RaisedTimerResolution = FALSE;
+        ExSetTimerResolution(0, FALSE);
+    }
 
     if (Device->HoldsPower)
     {
