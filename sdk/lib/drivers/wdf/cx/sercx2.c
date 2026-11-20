@@ -1044,6 +1044,7 @@ SerCx2NonPioAbort(
     BOOLEAN Receive = Transaction == &Device->Rx;
     SERCX2_TRANSACTION_TYPE Type;
     BOOLEAN Draining;
+    WDFREQUEST Request;
     KIRQL OldIrql;
 
     KeAcquireSpinLock(&Device->Lock, &OldIrql);
@@ -1057,31 +1058,46 @@ SerCx2NonPioAbort(
     Transaction->AbortStatus = Status;
     Type = Transaction->Type;
     Draining = Transaction->Draining;
+    Request = Transaction->Request;
+    /* Keeps the request alive while a custom transaction is cancelled below */
+    WdfObjectReference(Request);
     KeReleaseSpinLock(&Device->Lock, OldIrql);
 
     if (Type == SerCx2TransactionTypeSystemDma)
     {
         PSERCX2_SYSTEM_DMA_CONTEXT Dma = SerCx2DmaFor(Device, Receive);
 
-        if (Dma == NULL)
-            return;
-        if (Draining)
+        if (Dma != NULL)
         {
-            if (Dma->TxConfig.EvtSerCx2SystemDmaTransmitCancelDrainFifo != NULL &&
-                Dma->TxConfig.EvtSerCx2SystemDmaTransmitCancelDrainFifo(Device->SystemDmaTransmit))
+            if (Draining)
             {
-                Transaction->Draining = FALSE;
-                SerCx2NonPioFinish(Device, Transaction, Status, Transaction->Transferred);
+                if (Dma->TxConfig.EvtSerCx2SystemDmaTransmitCancelDrainFifo != NULL &&
+                    Dma->TxConfig.EvtSerCx2SystemDmaTransmitCancelDrainFifo(Device->SystemDmaTransmit))
+                {
+                    Transaction->Draining = FALSE;
+                    SerCx2NonPioFinish(Device, Transaction, Status, Transaction->Transferred);
+                }
             }
-            return;
+            else
+            {
+                WdfDmaTransactionStopSystemTransfer(Dma->Transaction);
+            }
         }
-        WdfDmaTransactionStopSystemTransfer(Dma->Transaction);
     }
     else if (Type == SerCx2TransactionTypeCustom)
     {
-        /* FIXME: a time-out or purge does not end a custom transaction; the driver owns the request and only a cancel of the IRP reaches it */
-        DPRINT1("SerCx2: %s custom transaction not ended by status 0x%08lx\n", Receive ? "receive" : "transmit", Status);
+        /*
+         * The controller driver owns a custom transaction's request: a time-out
+         * or purge ends it the way it ends on Windows, by cancelling the IRP.
+         * The driver's cancel routine (marked when the transaction started)
+         * stops its DMA and completes the request with the bytes moved so far.
+         */
+        DPRINT1("SerCx2: cancelling the %s custom transaction for status 0x%08lx\n",
+                Receive ? "receive" : "transmit", Status);
+        IoCancelIrp(WdfRequestWdmGetIrp(Request));
     }
+
+    WdfObjectDereference(Request);
 }
 
 static
