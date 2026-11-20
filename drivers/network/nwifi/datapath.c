@@ -77,12 +77,15 @@ NwifiLinearizeNb(
 
 /* Build a single-buffer NBL around a freshly allocated frame buffer; the
  * per-NBL context records what the free path must release. */
+#define NWIFI_TEST_TX_BACKFILL 64
+
 static
 PNET_BUFFER_LIST
 NwifiBuildNbl(
     _In_ PNWIFI_ADAPTER Adapter,
     _In_ NDIS_HANDLE Pool,
     _In_ PUCHAR FrameBuffer,
+    _In_ ULONG Backfill,
     _In_ ULONG FrameLength,
     _In_opt_ PNET_BUFFER_LIST OriginalNbl)
 {
@@ -90,7 +93,7 @@ NwifiBuildNbl(
     PNET_BUFFER_LIST Nbl;
     PNWIFI_NBL_CONTEXT Ctx;
 
-    Mdl = NdisAllocateMdl(Adapter->FilterHandle, FrameBuffer, FrameLength);
+    Mdl = NdisAllocateMdl(Adapter->FilterHandle, FrameBuffer, Backfill + FrameLength);
     if (Mdl == NULL)
     {
         return NULL;
@@ -100,7 +103,7 @@ NwifiBuildNbl(
                                                 NWIFI_NBL_CONTEXT_SIZE,
                                                 0,
                                                 Mdl,
-                                                0,
+                                                Backfill,
                                                 FrameLength);
     if (Nbl == NULL)
     {
@@ -248,12 +251,13 @@ NwifiTranslateTxFrame(
 
     /* New 802.11 frame: MAC header + SNAP + payload (Ethernet addrs/type dropped). */
     FrameLength = IEEE80211_MAC_HEADER_LEN + RFC1042_SNAP_HEADER_LEN + PayloadLength;
-    Frame = (PUCHAR)NwifiAllocate(FrameLength);
+    Frame = (PUCHAR)NwifiAllocate(NWIFI_TEST_TX_BACKFILL + FrameLength);
     if (Frame == NULL)
     {
         return NULL;
     }
 
+    Frame += NWIFI_TEST_TX_BACKFILL;
     MacHeader = (PIEEE80211_MAC_HEADER)Frame;
     MacHeader->FrameControl[0] = IEEE80211_FC0_VERSION_0 |
                                  IEEE80211_FC0_TYPE_DATA |
@@ -285,10 +289,11 @@ NwifiTranslateTxFrame(
     Payload = Frame + IEEE80211_MAC_HEADER_LEN + RFC1042_SNAP_HEADER_LEN;
     RtlCopyMemory(Payload, &Eth[ETH_HEADER_LEN], PayloadLength);
 
-    Nbl = NwifiBuildNbl(Adapter, Adapter->TxNblPool, Frame, FrameLength, OriginalNbl);
+    Nbl = NwifiBuildNbl(Adapter, Adapter->TxNblPool, Frame - NWIFI_TEST_TX_BACKFILL,
+                        NWIFI_TEST_TX_BACKFILL, FrameLength, OriginalNbl);
     if (Nbl == NULL)
     {
-        NwifiFree(Frame);
+        NwifiFree(Frame - NWIFI_TEST_TX_BACKFILL);
         return NULL;
     }
 
@@ -484,12 +489,13 @@ NwifiInjectL2Frame(
     }
 
     FrameLength = IEEE80211_MAC_HEADER_LEN + RFC1042_SNAP_HEADER_LEN + PayloadLength;
-    Frame = (PUCHAR)NwifiAllocate(FrameLength);
+    Frame = (PUCHAR)NwifiAllocate(NWIFI_TEST_TX_BACKFILL + FrameLength);
     if (Frame == NULL)
     {
         return NDIS_STATUS_RESOURCES;
     }
 
+    Frame += NWIFI_TEST_TX_BACKFILL;
     MacHeader = (PIEEE80211_MAC_HEADER)Frame;
     MacHeader->FrameControl[0] = IEEE80211_FC0_VERSION_0 |
                                  IEEE80211_FC0_TYPE_DATA |
@@ -522,10 +528,11 @@ NwifiInjectL2Frame(
     RtlCopyMemory(Frame + IEEE80211_MAC_HEADER_LEN + RFC1042_SNAP_HEADER_LEN,
                   Payload, PayloadLength);
 
-    Nbl = NwifiBuildNbl(Adapter, Adapter->TxNblPool, Frame, FrameLength, NULL);
+    Nbl = NwifiBuildNbl(Adapter, Adapter->TxNblPool, Frame - NWIFI_TEST_TX_BACKFILL,
+                        NWIFI_TEST_TX_BACKFILL, FrameLength, NULL);
     if (Nbl == NULL)
     {
-        NwifiFree(Frame);
+        NwifiFree(Frame - NWIFI_TEST_TX_BACKFILL);
         return NDIS_STATUS_RESOURCES;
     }
 
@@ -658,7 +665,7 @@ NwifiTranslateRxFrame(
     Eth[ETH_TYPE_OFFSET + 1] = Snap->EtherType[1];
     RtlCopyMemory(&Eth[ETH_HEADER_LEN], Payload, PayloadLength);
 
-    Nbl = NwifiBuildNbl(Adapter, Adapter->RxNblPool, Eth, EthLength, NULL);
+    Nbl = NwifiBuildNbl(Adapter, Adapter->RxNblPool, Eth, 0, EthLength, NULL);
     if (Nbl == NULL)
     {
         NwifiFree(Eth);

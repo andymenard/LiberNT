@@ -466,6 +466,17 @@ Ndis6WdiQueueFrame(
     Nbl->MiniportReserved[0] = Metadata;
     Nbl->MiniportReserved[1] = NULL;
 
+    if (!Injected && Metadata->u.txMetaData.bAllowLegacyRates)
+    {
+        PNET_BUFFER Nb = NET_BUFFER_LIST_FIRST_NB(Nbl);
+
+        DbgPrint("WDI tx: EAPOL frame %u port %u peer %u tid %u exemption %u backfill %u/%u send-completion %u\n",
+                 Metadata->FrameID, Metadata->u.txMetaData.PortID, Metadata->u.txMetaData.PeerID,
+                 Metadata->u.txMetaData.ExTID, Metadata->u.txMetaData.ExemptionAction,
+                 Nb ? NET_BUFFER_CURRENT_MDL_OFFSET(Nb) : 0, Wdi->BackFillSize,
+                 !Wdi->TxRxCaps.TransmitCapabilities.ExplicitSendCompleteFlagRequired);
+    }
+
     KeAcquireSpinLock(&Wdi->TxDescLock, &OldIrql);
     Wdi->Tal.TxTargetDescInitHandler(Wdi->TalContext, Nbl, &Status);
     KeReleaseSpinLock(&Wdi->TxDescLock, OldIrql);
