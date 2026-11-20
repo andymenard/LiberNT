@@ -1296,7 +1296,8 @@ HalEnableSystemInterrupt(
     /* Write back the entry */
     ApicWriteIORedirectionEntry(Index, ReDirReg);
 
-    DPRINT("HalEnableSystemInterrupt: RTE[%u] vector 0x%lx -> phys APIC 0x%x (%s)\n", Index, Vector, ReDirReg.Destination, ReDirReg.TriggerMode ? "level" : "edge");
+    /* TEMPORARY Surface diag: was DPRINT, remove before commit */
+    DPRINT1("HalEnableSystemInterrupt: RTE[%u] vector 0x%lx -> phys APIC 0x%x (%s, active %s)\n", Index, Vector, ReDirReg.Destination, ReDirReg.TriggerMode ? "level" : "edge", ReDirReg.Polarity ? "low" : "high");
 
     return TRUE;
 }

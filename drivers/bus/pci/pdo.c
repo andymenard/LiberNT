@@ -2583,6 +2583,15 @@ PciPdoRoutedInterruptLine(
                         InterruptLine);
             }
 
+            /* TEMPORARY Surface diag: remove before commit */
+            DPRINT1("pci diag: %02x:%02x.%u INT%c# -> GSI %lu (config line %u, depth %lu)\n",
+                    (UCHAR)DeviceExtension->PciDevice->BusNumber,
+                    DeviceExtension->PciDevice->SlotNumber.u.bits.DeviceNumber,
+                    DeviceExtension->PciDevice->SlotNumber.u.bits.FunctionNumber,
+                    'A' + InterruptPin - 1,
+                    Gsi,
+                    InterruptLine,
+                    Depth);
             return (UCHAR)Gsi;
         }
 
