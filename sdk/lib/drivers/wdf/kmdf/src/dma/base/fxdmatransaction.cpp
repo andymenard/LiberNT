@@ -1060,6 +1060,10 @@ FxDmaScatterGatherTransaction::StageTransfer(
                                       this);
     }
 
+    /* TEMPORARY Surface diag: remove before commit */
+    DbgPrint("wdf dma: transaction %p %s SG list for %Iu bytes -> 0x%08lx\n", dmaTransaction,
+             m_DmaEnabler->m_IsSGListAllocated ? "Build" : "Get", m_CurrentFragmentLength, status);
+
     if (!NT_SUCCESS(status)) {
         DoTraceLevelMessage(pFxDriverGlobals, TRACE_LEVEL_ERROR, TRACINGDMA,
                             "Build or GetScatterGatherList failed for "
@@ -1120,6 +1124,12 @@ FxDmaScatterGatherTransaction::_AdapterListControl(
     ASSERT(SgList->NumberOfElements <= pDmaTransaction->m_DmaEnabler->GetMaxSGElements());
 
     pDmaTransaction->m_SGList = SgList;
+
+    /* TEMPORARY Surface diag: remove before commit */
+    DbgPrint("wdf dma: transaction %p SG ProgramDma, %lu element(s), first 0x%I64x len %lu\n", dmaTransaction,
+             SgList->NumberOfElements,
+             SgList->NumberOfElements ? SgList->Elements[0].Address.QuadPart : 0,
+             SgList->NumberOfElements ? SgList->Elements[0].Length : 0);
 
     //
     // We ignore the return value. The pattern we want the driver to follow is
@@ -1636,6 +1646,9 @@ FxDmaPacketTransaction::StartTransfer(
         status = AllocateAdapterChannel(m_MapRegistersReserved > 0);
     }
 
+    /* TEMPORARY Surface diag: remove before commit */
+    DbgPrint("wdf dma: transaction %p packet AllocateAdapterChannel -> 0x%08lx\n", dmaTransaction, status);
+
     if (!NT_SUCCESS(status)) {
         DoTraceLevelMessage(pFxDriverGlobals, TRACE_LEVEL_ERROR, TRACINGDMA,
                             "AllocateAdapterChannel failed for "
@@ -2062,6 +2075,11 @@ FxDmaPacketTransaction::StageTransfer(
                                         GetHandle()
                                         );
                 }
+
+                /* TEMPORARY Surface diag: remove before commit */
+                DbgPrint("wdf dma: transaction %p packet ProgramDma, first 0x%I64x len %lu\n", GetHandle(),
+                         sgList->NumberOfElements ? sgList->Elements[0].Address.QuadPart : 0,
+                         sgList->NumberOfElements ? sgList->Elements[0].Length : 0);
 
                 //
                 // Call program DMA

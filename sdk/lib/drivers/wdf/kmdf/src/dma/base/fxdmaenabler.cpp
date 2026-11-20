@@ -801,6 +801,14 @@ FxDmaEnabler::InitializeResources(
                             &AdapterInfo->DeviceDescription,
                             (PULONG)&AdapterInfo->NumberOfMapRegisters);
 
+    /* TEMPORARY Surface diag: remove before commit */
+    DbgPrint("wdf dma: enabler %p profile %d adapter %p maps %lu desc v%lu master %u sg %u dma32 %u dma64 %u width %lu maxlen 0x%lx\n",
+             GetHandle(), (int)m_Profile, AdapterInfo->AdapterObject, AdapterInfo->NumberOfMapRegisters,
+             AdapterInfo->DeviceDescription.Version, AdapterInfo->DeviceDescription.Master,
+             AdapterInfo->DeviceDescription.ScatterGather, AdapterInfo->DeviceDescription.Dma32BitAddresses,
+             AdapterInfo->DeviceDescription.Dma64BitAddresses, AdapterInfo->DeviceDescription.DmaAddressWidth,
+             AdapterInfo->DeviceDescription.MaximumLength);
+
     if (AdapterInfo->AdapterObject == NULL) {
         status = STATUS_UNSUCCESSFUL;
         DoTraceLevelMessage(pFxDriverGlobals, TRACE_LEVEL_ERROR, TRACINGDMA,
