@@ -178,6 +178,9 @@ typedef struct _TPADHID_DEVICE_EXTENSION
     TPADHID_CONTACT FrameContacts[TPADHID_MAX_CONTACTS];
 
     KSPIN_LOCK GestureLock;
+    ULONG TraceContactFrames;
+    ULONG TraceMousePackets;
+    ULONG TraceUnconsumedPackets;
     KTIMER TapTimer;
     KDPC TapDpc;
     struct _TPADHID_DEVICE_EXTENSION *KeySink;
@@ -1207,6 +1210,19 @@ TpadProcessFrame(
 
     if (Count && DeviceExtension->ClassService)
         DeviceExtension->ClassService(DeviceExtension->ClassDeviceObject, Data, Data + Count, &Consumed);
+
+    if (ActiveCount || Count)
+    {
+        ULONG Frame = ++DeviceExtension->TraceContactFrames;
+        DeviceExtension->TraceMousePackets += Count;
+        DeviceExtension->TraceUnconsumedPackets += Count - Consumed;
+        if (Frame == 1 || (Frame & 127) == 0)
+        {
+            DbgPrint("TPADTRACE frame=%lu contacts=%lu packets=%lu unconsumed=%lu callback=%u\n",
+                     Frame, ActiveCount, DeviceExtension->TraceMousePackets,
+                     DeviceExtension->TraceUnconsumedPackets, DeviceExtension->ClassService != NULL);
+        }
+    }
 
     KeReleaseSpinLock(&DeviceExtension->GestureLock, OldIrql);
 }

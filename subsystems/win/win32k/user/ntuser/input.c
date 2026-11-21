@@ -145,6 +145,8 @@ typedef struct _INPUT_DEVICE
     BOOLEAN Keyboard;
     BOOLEAN ReadPending;
     BOOLEAN ReadDone;
+    ULONG TraceMouseReads;
+    ULONG TraceMouseSubmissions;
     PINPUT_TARGET Target;
     UNICODE_STRING Path;
     union
@@ -298,6 +300,11 @@ InputDeviceClose(
     PINPUT_DEVICE Device = State->Devices[Index];
     IO_STATUS_BLOCK Iosb;
     HANDLE Handle;
+
+    if (!Device->Keyboard)
+        DbgPrint("WIN_READ %wZ close event=%p pending=%u done=%u status=%08lx\n",
+                 &Device->Path, Device->ReadEvent, Device->ReadPending,
+                 Device->ReadDone, Device->Iosb.Status);
 
     UserEnterExclusive();
     State->Devices[Index] = NULL;
@@ -802,6 +809,13 @@ InputDevicesPrepareWait(
                                     NULL);
             }
             InputDeviceUnlock(State);
+            if (!Device->Keyboard)
+            {
+                ULONG Read = ++Device->TraceMouseSubmissions;
+                if (Read == 1 || (Read & 127) == 0 || !NT_SUCCESS(Status))
+                    DbgPrint("WIN_READ %wZ submit=%lu event=%p status=%08lx\n",
+                             &Device->Path, Read, Device->ReadEvent, Status);
+            }
             if (Status == STATUS_PENDING)
             {
                 Device->ReadPending = TRUE;
@@ -837,6 +851,12 @@ InputDevicesSignaled(
         Device = State->Devices[Index];
         if (Device && Device->ReadPending && Object == Device->ReadEvent)
         {
+            if (!Device->Keyboard &&
+                (Device->TraceMouseSubmissions == 1 || (Device->TraceMouseSubmissions & 127) == 0 ||
+                 !NT_SUCCESS(Device->Iosb.Status)))
+                DbgPrint("WIN_READ %wZ wake=%lu event=%p status=%08lx bytes=%Iu\n",
+                         &Device->Path, Device->TraceMouseSubmissions, Object,
+                         Device->Iosb.Status, Device->Iosb.Information);
             Device->ReadPending = FALSE;
             Device->ReadDone = TRUE;
             return TRUE;
@@ -860,6 +880,9 @@ InputProcessMouse(
     }
 
     MouseInputCount = (ULONG)(Device->Iosb.Information / sizeof(MOUSE_INPUT_DATA));
+    ULONG Read = ++Device->TraceMouseReads;
+    if (Read == 1 || (Read & 127) == 0)
+        DbgPrint("WIN32K_INPUT_TRACE %wZ read=%lu packets=%lu\n", &Device->Path, Read, MouseInputCount);
     for (i = 0; i < MouseInputCount; ++i)
     {
         PMOUSE_INPUT_DATA MouseInput = &Device->Data.Mouse[i];
@@ -907,6 +930,9 @@ InputDevicesProcess(VOID)
         if (!NT_SUCCESS(Device->Iosb.Status))
         {
             WARN("Input device %wZ stopped: 0x%08lx\n", &Device->Path, Device->Iosb.Status);
+            if (!Device->Keyboard)
+                DbgPrint("WIN32K_INPUT_TRACE %wZ stopped status=0x%08lx reads=%lu\n",
+                         &Device->Path, Device->Iosb.Status, Device->TraceMouseReads);
             InputDeviceClose(State, Index);
             continue;
         }
