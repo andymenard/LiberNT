@@ -209,6 +209,7 @@ list(APPEND ACPI_SOURCE
     ged.c
     interface.c
     opregion.c
+    gsbus.c
     cmos.c
     cmos_core.c
     pnp.c

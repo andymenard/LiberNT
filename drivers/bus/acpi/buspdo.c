@@ -1017,8 +1017,36 @@ BuspRegisterConnectionResource(
         DPRINT1("ACPI: Resource Hub registration failed for %08lx%08lx (0x%08lx)\n", (ULONG)(ConnectionId >> 32), (ULONG)ConnectionId, Status);
     ExFreePoolWithTag(Input, 'iRhA');
 }
+
+/* Register a GenericSerialBus field's Connection() with the Resource Hub so
+ * it can be opened as \Device\RESOURCE_HUB\<id> (see gsbus.c). */
+ULONGLONG
+BuspRegisterGsbConnection(
+    _In_ PPDO_DEVICE_DATA DeviceData,
+    _In_ ACPI_RESOURCE *Resource,
+    _Out_ PDEVICE_OBJECT *Controller)
+{
+    UCHAR Type;
+    ULONGLONG ConnectionId;
+
+    *Controller = BuspGetConnectionController(DeviceData, Resource);
+    if (!*Controller || Resource->Type != ACPI_RESOURCE_TYPE_SERIAL_BUS)
+        return 0;
+    switch (Resource->Data.CommonSerialBus.Type)
+    {
+        case ACPI_RESOURCE_SERIAL_TYPE_I2C: Type = CM_RESOURCE_CONNECTION_TYPE_SERIAL_I2C; break;
+        case ACPI_RESOURCE_SERIAL_TYPE_SPI: Type = CM_RESOURCE_CONNECTION_TYPE_SERIAL_SPI; break;
+        case ACPI_RESOURCE_SERIAL_TYPE_UART: Type = CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART; break;
+        default: return 0;
+    }
+    /* Resource index 0x47534200 ('GSB') keeps these apart from _CRS connections. */
+    ConnectionId = BuspGetConnectionId(DeviceData, 0x47534200, CM_RESOURCE_CONNECTION_CLASS_SERIAL, Type);
+    BuspRegisterConnectionResource(DeviceData, Resource, ConnectionId, CM_RESOURCE_CONNECTION_CLASS_SERIAL, Type);
+    return ConnectionId;
+}
 #else
 #define BuspRegisterConnectionResource(DeviceData, Resource, ConnectionId, ConnectionClass, ConnectionType) ((void)0)
+#define BuspRegisterGsbConnection(DeviceData, Resource, Controller) (*(Controller) = NULL, 0ULL)
 #endif
 
 static
@@ -3358,6 +3386,7 @@ Bus_PDO_PnP (
         PoSetPowerState(DeviceData->Common.Self, DevicePowerState, state);
         DeviceData->Common.DevicePowerState = PowerDeviceD0;
         SET_NEW_PNP_STATE(DeviceData->Common, Started);
+        AcpiGsbPdoStarted(DeviceData);
         status = STATUS_SUCCESS;
         break;
 

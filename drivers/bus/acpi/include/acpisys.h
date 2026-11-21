@@ -58,6 +58,7 @@ typedef struct _PDO_DEVICE_DATA
     // The array itself also null terminated
     PWCHAR      HardwareIDs;
     BOOLEAN     DockDevice;
+    BOOLEAN     GsbHandlerInstalled;
     // Link point to hold all the PDOs for a single bus together
     LIST_ENTRY  Link;
     ULONG       InterfaceRefCount;
@@ -307,6 +308,10 @@ NTSTATUS
 Bus_StartFdo (
       PFDO_DEVICE_DATA            FdoData,
       PIRP   Irp );
+
+VOID
+AcpiGsbPdoStarted(
+    _In_ PPDO_DEVICE_DATA DeviceData);
 
 BOOLEAN
 BuspAreConnectionControllersReady(
