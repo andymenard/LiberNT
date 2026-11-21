@@ -717,7 +717,7 @@ NwifiReceiveFromLower(
 
         for (; NetBuffer != NULL; NetBuffer = NET_BUFFER_NEXT_NB(NetBuffer))
         {
-            UCHAR Frame[NWIFI_MAX_80211_FRAME];
+            UCHAR Frame[NWIFI_MAX_RX_80211_FRAME];
             ULONG FrameLength = NET_BUFFER_DATA_LENGTH(NetBuffer);
             PNET_BUFFER_LIST UpNbl;
 

@@ -104,6 +104,12 @@ typedef struct _RFC1042_SNAP_HEADER
 #define NWIFI_MAX_80211_FRAME \
     (IEEE80211_MAC_HEADER_LEN + RFC1042_SNAP_HEADER_LEN + ETH_MTU)
 
+/* Largest received 802.11 data MPDU we translate.  APs send QoS data frames,
+ * whose header carries QoS Control (+2) and optionally HT Control (+4), so a
+ * full 1500-byte payload does not fit in NWIFI_MAX_80211_FRAME. */
+#define NWIFI_MAX_RX_80211_FRAME \
+    (NWIFI_MAX_80211_FRAME + IEEE80211_QOS_CONTROL_LEN + IEEE80211_HT_CONTROL_LEN)
+
 /* EtherTypes that, per RFC 1042 / IEEE 802.1H, use the bridge-tunnel SNAP OUI
  * (00-00-F8) instead of the RFC 1042 OUI (00-00-00). */
 #define ETHERTYPE_AARP              0x80F3
