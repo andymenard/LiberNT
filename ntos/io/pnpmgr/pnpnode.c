@@ -456,6 +456,8 @@ PiUpdateServiceEnum(
     KeReleaseMutex(Lock, FALSE);
 }
 
+static ULONG IopDeviceStartOrder;
+
 PNP_DEVNODE_STATE
 PiSetDevNodeState(
     _In_ PDEVICE_NODE DeviceNode,
@@ -476,6 +478,11 @@ PiSetDevNodeState(
 
         DeviceNode->PreviousState = Previous;
         DeviceNode->State = NewState;
+
+        /* The power manager powers devices down in reverse start order: a
+         * device started after another usually depends on it. */
+        if (NewState == DeviceNodeStarted)
+            DeviceNode->StartOrder = ++IopDeviceStartOrder;
     }
 
     KeReleaseSpinLock(&IopDeviceTreeLock, OldIrql);

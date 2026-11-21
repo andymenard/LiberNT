@@ -1142,6 +1142,9 @@ typedef struct _DEVICE_NODE
 #if (NTDDI_VERSION >= NTDDI_LONGHORN)
     ULONG NumaNodeIndex;
 #endif
+#ifdef __REACTOS__
+    ULONG StartOrder;   /* Increasing stamp set each time the node is started */
+#endif
 #if DBG
     volatile PVOID DiagWalkOwner;
 #endif

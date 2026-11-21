@@ -503,25 +503,21 @@ PopSleepIrpCompletion(
 }
 
 static
-NTSTATUS
-PopSleepDeviceTraverse(
-    _In_ PDEVICE_NODE DeviceNode,
-    _In_ PVOID Context)
+VOID
+PopSleepSendDeviceIrp(
+    _Inout_ PPOP_SLEEP_TRAVERSE Traverse,
+    _In_ PDEVICE_NODE DeviceNode)
 {
-    PPOP_SLEEP_TRAVERSE Traverse = Context;
     PPOP_SLEEP_IRP_CONTEXT IrpContext;
     PDEVICE_OBJECT TopDeviceObject;
     PIO_STACK_LOCATION Stack;
     PIRP Irp;
 
-    if (DeviceNode->Level != Traverse->Level || !PopSleepIsActiveNode(DeviceNode))
-        return STATUS_SUCCESS;
-
     TopDeviceObject = IoGetAttachedDeviceReference(DeviceNode->PhysicalDeviceObject);
     if (TopDeviceObject == Traverse->PowerDevice)
     {
         ObDereferenceObject(TopDeviceObject);
-        return STATUS_SUCCESS;
+        return;
     }
 
     IrpContext = ExAllocatePoolWithTag(NonPagedPool, sizeof(*IrpContext), POP_SLEEP_TAG);
@@ -532,7 +528,7 @@ PopSleepDeviceTraverse(
             ExFreePoolWithTag(IrpContext, POP_SLEEP_TAG);
         ObDereferenceObject(TopDeviceObject);
         PopSleepRecordStatus(Traverse, DeviceNode, STATUS_INSUFFICIENT_RESOURCES);
-        return STATUS_SUCCESS;
+        return;
     }
 
     IrpContext->Traverse = Traverse;
@@ -558,7 +554,145 @@ PopSleepDeviceTraverse(
 
     InterlockedIncrement(&Traverse->Pending);
     PoCallDriver(TopDeviceObject, Irp);
+}
+
+static
+NTSTATUS
+PopSleepDeviceTraverse(
+    _In_ PDEVICE_NODE DeviceNode,
+    _In_ PVOID Context)
+{
+    PPOP_SLEEP_TRAVERSE Traverse = Context;
+
+    if (DeviceNode->Level == Traverse->Level && PopSleepIsActiveNode(DeviceNode))
+        PopSleepSendDeviceIrp(Traverse, DeviceNode);
     return STATUS_SUCCESS;
+}
+
+/*
+ * Powering down follows dependencies rather than tree depth. A device that
+ * uses another one (the Surface serial hub talks to the embedded controller
+ * through a PCI UART that sits deeper in the tree) is started after it, so the
+ * devices go down one at a time in reverse start order. A node's key is the
+ * smallest start stamp in its subtree, so a parent always follows all of its
+ * children even if it was restarted later.
+ */
+typedef struct _POP_SLEEP_ORDER_ENTRY
+{
+    PDEVICE_NODE DeviceNode;
+    ULONG Key;
+} POP_SLEEP_ORDER_ENTRY, *PPOP_SLEEP_ORDER_ENTRY;
+
+typedef struct _POP_SLEEP_ORDER
+{
+    PPOP_SLEEP_ORDER_ENTRY Entries;
+    ULONG Count;
+    ULONG Capacity;
+} POP_SLEEP_ORDER, *PPOP_SLEEP_ORDER;
+
+static
+ULONG
+PopSleepSubtreeStartKey(
+    _In_ PDEVICE_NODE DeviceNode)
+{
+    PDEVICE_NODE Child;
+    ULONG Key = DeviceNode->StartOrder;
+    ULONG ChildKey;
+
+    for (Child = DeviceNode->Child; Child != NULL; Child = Child->Sibling)
+    {
+        ChildKey = PopSleepSubtreeStartKey(Child);
+        if (ChildKey < Key)
+            Key = ChildKey;
+    }
+    return Key;
+}
+
+static
+NTSTATUS
+PopSleepCountTraverse(
+    _In_ PDEVICE_NODE DeviceNode,
+    _In_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceNode);
+    (*(PULONG)Context)++;
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+PopSleepCollectTraverse(
+    _In_ PDEVICE_NODE DeviceNode,
+    _In_ PVOID Context)
+{
+    PPOP_SLEEP_ORDER Order = Context;
+
+    if (!PopSleepIsActiveNode(DeviceNode) || Order->Count >= Order->Capacity)
+        return STATUS_SUCCESS;
+
+    ObReferenceObject(DeviceNode->PhysicalDeviceObject);
+    Order->Entries[Order->Count].DeviceNode = DeviceNode;
+    Order->Entries[Order->Count].Key = PopSleepSubtreeStartKey(DeviceNode);
+    Order->Count++;
+    return STATUS_SUCCESS;
+}
+
+static
+BOOLEAN
+PopSleepOrderBefore(
+    _In_ PPOP_SLEEP_ORDER_ENTRY A,
+    _In_ PPOP_SLEEP_ORDER_ENTRY B)
+{
+    if (A->Key != B->Key)
+        return A->Key > B->Key;
+    return A->DeviceNode->Level > B->DeviceNode->Level;
+}
+
+static
+BOOLEAN
+PopSleepSendInPowerDownOrder(
+    _Inout_ PPOP_SLEEP_TRAVERSE Traverse)
+{
+    DEVICETREE_TRAVERSE_CONTEXT Context;
+    POP_SLEEP_ORDER Order;
+    POP_SLEEP_ORDER_ENTRY Entry;
+    ULONG NodeCount = 0;
+    ULONG i, j;
+
+    IopInitDeviceTreeTraverseContext(&Context, IopRootDeviceNode, PopSleepCountTraverse, &NodeCount);
+    IopTraverseDeviceTree(&Context);
+    if (NodeCount == 0)
+        return TRUE;
+
+    Order.Count = 0;
+    Order.Capacity = NodeCount;
+    Order.Entries = ExAllocatePoolWithTag(NonPagedPool, NodeCount * sizeof(*Order.Entries), POP_SLEEP_TAG);
+    if (Order.Entries == NULL)
+        return FALSE;
+
+    IopInitDeviceTreeTraverseContext(&Context, IopRootDeviceNode, PopSleepCollectTraverse, &Order);
+    IopTraverseDeviceTree(&Context);
+
+    for (i = 1; i < Order.Count; i++)
+    {
+        Entry = Order.Entries[i];
+        for (j = i; j > 0 && PopSleepOrderBefore(&Entry, &Order.Entries[j - 1]); j--)
+            Order.Entries[j] = Order.Entries[j - 1];
+        Order.Entries[j] = Entry;
+    }
+
+    for (i = 0; i < Order.Count; i++)
+    {
+        Traverse->Pending = 1;
+        KeClearEvent(&Traverse->Event);
+        PopSleepSendDeviceIrp(Traverse, Order.Entries[i].DeviceNode);
+        if (InterlockedDecrement(&Traverse->Pending) != 0)
+            KeWaitForSingleObject(&Traverse->Event, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(Order.Entries[i].DeviceNode->PhysicalDeviceObject);
+    }
+
+    ExFreePoolWithTag(Order.Entries, POP_SLEEP_TAG);
+    return TRUE;
 }
 
 static
@@ -645,8 +779,11 @@ PopSleepSendDevices(
         return Traverse.Status;
     }
 
-    for (Level = DeepestLevel; Level > 0; Level--)
-        PopSleepSendToLevel(&Traverse, Level);
+    if (!PopSleepSendInPowerDownOrder(&Traverse))
+    {
+        for (Level = DeepestLevel; Level > 0; Level--)
+            PopSleepSendToLevel(&Traverse, Level);
+    }
 
     if (!NT_SUCCESS(Traverse.Status))
         return Traverse.Status;
