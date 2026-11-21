@@ -756,7 +756,10 @@ Ndis6FilterTerminalReturn(
         return;
     }
 
-    NET_BUFFER_LIST_NEXT_NBL(NetBufferList) = NULL;
+    /* NetBufferList may be a chain (NdisFReturnNetBufferLists from the
+     * bottom filter); hand all of it back. Clearing the link here returned
+     * only the first NBL and leaked the rest of the miniport's receive
+     * buffers. Internal callers already pass detached NBLs. */
     Ext->DriverBlock->Characteristics.ReturnNetBufferListsHandler(
         Ext->MiniportAdapterContext, NetBufferList, ReturnFlags);
 }
