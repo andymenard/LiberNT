@@ -163,8 +163,29 @@ ClassRead(
 	}
 
 	KeAcquireSpinLock(&DeviceExtension->SpinLock, &OldIrql);
+	ULONG Read = ++DeviceExtension->TraceReads;
+	if (Read == 1 || (Read & 127) == 0)
+		DbgPrint("MOU_READ %p read=%lu irp=%p event=%p old=%p queued=%Iu\n",
+		         ClassDevice, Read, Irp, Irp->UserEvent, DeviceExtension->PendingIrp,
+		         DeviceExtension->InputCount);
+	/* Input belongs to the reader that already has a request outstanding. */
+	if (DeviceExtension->PendingIrp)
+	{
+		KeReleaseSpinLock(&DeviceExtension->SpinLock, OldIrql);
+		Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
+		Irp->IoStatus.Information = 0;
+		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		return STATUS_DEVICE_BUSY;
+	}
+
 	Status = HandleReadIrp(ClassDevice, Irp, FALSE);
 	KeReleaseSpinLock(&DeviceExtension->SpinLock, OldIrql);
+	if (Status == STATUS_CANCELLED)
+	{
+		Irp->IoStatus.Status = Status;
+		Irp->IoStatus.Information = 0;
+		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	}
 	return Status;
 }
 
@@ -575,9 +596,19 @@ ClassCallback(
 
 		(*ConsumedCount) += (ULONG)ReadSize;
 
+		ULONG Callback = ++ClassDeviceExtension->TraceCallbacks;
+		if (Callback == 1 || (Callback & 127) == 0)
+			DbgPrint("MOUCLASS_TRACE %p callback=%lu offered=%Iu accepted=%Iu queued=%Iu pending=%u\n",
+			         ClassDeviceObject, Callback, InputCount, ReadSize,
+			         ClassDeviceExtension->InputCount, ClassDeviceExtension->PendingIrp != NULL);
+
 		/* Complete pending IRP (if any) */
-		if (ClassDeviceExtension->PendingIrp)
-			HandleReadIrp(ClassDeviceObject, ClassDeviceExtension->PendingIrp, FALSE);
+		PIRP PendingIrp = ClassDeviceExtension->PendingIrp;
+		if (PendingIrp && IoSetCancelRoutine(PendingIrp, NULL))
+		{
+			ClassDeviceExtension->PendingIrp = NULL;
+			HandleReadIrp(ClassDeviceObject, PendingIrp, FALSE);
+		}
 	}
 	KeReleaseSpinLock(&ClassDeviceExtension->SpinLock, OldIrql);
 
@@ -809,6 +840,8 @@ ClassCancelRoutine(
 
 	ASSERT(ClassDeviceExtension->Common.IsClassDO);
 
+	DbgPrint("MOU_READ %p cancel irp=%p event=%p\n", DeviceObject, Irp, Irp->UserEvent);
+
 	IoReleaseCancelSpinLock(Irp->CancelIrql);
 
 	KeAcquireSpinLock(&ClassDeviceExtension->SpinLock, &OldIrql);
@@ -877,9 +910,11 @@ HandleReadIrp(
 		/* Go to next packet and complete this request */
 		Irp->IoStatus.Status = Status;
 
-		(VOID)IoSetCancelRoutine(Irp, NULL);
+		ULONG Completion = ++DeviceExtension->TraceCompletions;
+		if (Completion == 1 || (Completion & 127) == 0 || !NT_SUCCESS(Status))
+			DbgPrint("MOU_READ %p complete=%lu irp=%p event=%p status=%08lx bytes=%Iu\n",
+			         DeviceObject, Completion, Irp, Irp->UserEvent, Status, Irp->IoStatus.Information);
 		IoCompleteRequest(Irp, IO_MOUSE_INCREMENT);
-		DeviceExtension->PendingIrp = NULL;
 	}
 	else
 	{
