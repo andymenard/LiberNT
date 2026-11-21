@@ -434,6 +434,47 @@ GenBtnConnect(
     return Extension->Capabilities ? STATUS_SUCCESS : STATUS_DEVICE_CONFIGURATION_ERROR;
 }
 
+/*
+ * Buttons without an ACPI0011 _DSD descriptor, such as the Surface power
+ * button (MSHW0040, one GPIO interrupt on both edges), get their event from
+ * the INF: the device key's GenBtnDefaultEvent value (SYS_BUTTON_*) applies
+ * to interrupt 0.
+ */
+static
+VOID
+GenBtnAddDefaultButton(
+    _Inout_ PGENBTN_EXTENSION Extension)
+{
+    UNICODE_STRING ValueName = RTL_CONSTANT_STRING(L"GenBtnDefaultEvent");
+    UCHAR Buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION Value = (PKEY_VALUE_PARTIAL_INFORMATION)Buffer;
+    PGENBTN_BUTTON Button;
+    HANDLE Key;
+    ULONG Length;
+    ULONG Event;
+    NTSTATUS Status;
+
+    Status = IoOpenDeviceRegistryKey(Extension->PhysicalDevice, PLUGPLAY_REGKEY_DEVICE, KEY_READ, &Key);
+    if (!NT_SUCCESS(Status))
+        return;
+    Status = ZwQueryValueKey(Key, &ValueName, KeyValuePartialInformation, Value, sizeof(Buffer), &Length);
+    ZwClose(Key);
+    if (!NT_SUCCESS(Status) || Value->Type != REG_DWORD || Value->DataLength != sizeof(ULONG))
+        return;
+
+    Event = *(PULONG)Value->Data & (SYS_BUTTON_POWER | SYS_BUTTON_SLEEP | SYS_BUTTON_WAKE);
+    if (Event == 0)
+        return;
+
+    Button = &Extension->Buttons[Extension->ButtonCount++];
+    Button->Extension = Extension;
+    Button->InterruptIndex = 0;
+    Button->Event = Event;
+    Button->Interrupt = NULL;
+    Button->Pressed = FALSE;
+    DPRINT1("GENBTN: default button 0x%lx on interrupt 0\n", Event);
+}
+
 static
 NTSTATUS
 GenBtnStart(
@@ -447,15 +488,19 @@ GenBtnStart(
     Extension->ButtonCount = 0;
     Extension->Capabilities = 0;
     Status = GenBtnEvaluateDsd(Extension, &Output, &OutputLength);
-    if (!NT_SUCCESS(Status))
+    if (NT_SUCCESS(Status))
+    {
+        GenBtnParseDsd(Extension, Output);
+        ExFreePoolWithTag(Output, GENBTN_TAG);
+    }
+    else
     {
         DPRINT1("GENBTN: _DSD evaluation failed 0x%08lx\n", Status);
-        return Status;
     }
-    GenBtnParseDsd(Extension, Output);
-    ExFreePoolWithTag(Output, GENBTN_TAG);
     if (Extension->ButtonCount == 0)
-        return STATUS_DEVICE_CONFIGURATION_ERROR;
+        GenBtnAddDefaultButton(Extension);
+    if (Extension->ButtonCount == 0)
+        return NT_SUCCESS(Status) ? STATUS_DEVICE_CONFIGURATION_ERROR : Status;
 
     Extension->Started = TRUE;
     Status = GenBtnConnect(Extension, Stack->Parameters.StartDevice.AllocatedResourcesTranslated);

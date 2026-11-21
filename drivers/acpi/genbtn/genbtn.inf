@@ -16,12 +16,26 @@ DefaultDestDir = 12
 
 [LiberNT]
 %GenBtn.DeviceDesc% = GenBtn_Inst,ACPI\ACPI0011
+%GenBtn.SurfaceDesc% = GenBtn_Surface_Inst,ACPI\MSHW0040
 
 [GenBtn_Inst.NT]
 CopyFiles = GenBtn_CopyFiles
 
 [GenBtn_CopyFiles]
 genbtn.sys
+
+[GenBtn_Surface_Inst.NT]
+CopyFiles = GenBtn_CopyFiles
+
+[GenBtn_Surface_Inst.NT.HW]
+AddReg = GenBtn_Surface_AddReg
+
+[GenBtn_Surface_AddReg]
+; SYS_BUTTON_POWER on interrupt 0
+HKR,,GenBtnDefaultEvent,0x00010001,1
+
+[GenBtn_Surface_Inst.NT.Services]
+AddService = GENBTN,0x00000002,GenBtn_Service
 
 [GenBtn_Inst.NT.Services]
 AddService = GENBTN,0x00000002,GenBtn_Service
@@ -37,4 +51,5 @@ LoadOrderGroup = Extended Base
 [Strings]
 LiberNT = "LiberNT Project"
 GenBtn.DeviceDesc = "ACPI Generic Buttons"
+GenBtn.SurfaceDesc = "Surface Power Button"
 GenBtn.ServiceDesc = "LiberNT ACPI Generic Button Driver"
