@@ -9,6 +9,7 @@
 #include "uxthemep.h"
 #include <reactos/dwmframe.h>
 #include <math.h>
+#include <winreg.h>
 
 #define NC_PREVIEW_MSGBOX_HALF_WIDTH 75
 #define NC_PREVIEW_MSGBOX_OFFSET_X -29
@@ -962,6 +963,33 @@ ThemeCaptionDpi(PDRAW_CONTEXT pcontext)
     return dpi ? dpi : 96;
 }
 
+/* Above 96 DPI, themes without high-DPI caption button images get flat
+ * vector glyphs by default. HKCU\Software\LiberNT\Theme
+ * ScaleCaptionBitmaps=1 keeps the theme's own button bitmaps (scaled), so
+ * DPI-aware windows look like DPI-unaware ones. */
+static BOOL
+ThemeCaptionGlyphsEnabled(void)
+{
+    static LONG Cached = -1;
+    DWORD Value = 0, Size = sizeof(Value);
+
+    if (Cached < 0)
+    {
+        HKEY Key;
+
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\LiberNT\\Theme", 0, KEY_QUERY_VALUE,
+                          &Key) == ERROR_SUCCESS)
+        {
+            if (RegQueryValueExW(Key, L"ScaleCaptionBitmaps", NULL, NULL, (LPBYTE)&Value,
+                                 &Size) != ERROR_SUCCESS)
+                Value = 0;
+            RegCloseKey(Key);
+        }
+        InterlockedExchange(&Cached, Value ? 0 : 1);
+    }
+    return Cached != 0;
+}
+
 static BOOL
 ThemeUseCaptionGlyphs(HTHEME hTheme, INT iPartId, INT iStateId, COLORREF *background)
 {
@@ -989,8 +1017,116 @@ ThemeUseCaptionGlyphs(HTHEME hTheme, INT iPartId, INT iStateId, COLORREF *backgr
     return TRUE;
 }
 
+/* Draw a 96-DPI caption button image the way DWM scales a DPI-unaware window:
+ * render it at its logical size, recover per-pixel alpha (drawn on black and
+ * on white, so any blit method works), upscale uniformly with bilinear
+ * filtering and alpha-blend it into prc. */
+static BOOL
+ThemeDrawScaledCaptionPart(HTHEME hTheme, HDC hDC, INT iPartId, INT iStateId, const RECT *prc, UINT dpi)
+{
+    INT w = prc->right - prc->left, h = prc->bottom - prc->top;
+    INT lw = MulDiv(w, 96, dpi), lh = MulDiv(h, 96, dpi), x, y, i;
+    BITMAPINFO bmi;
+    HDC hdcMem;
+    HBITMAP hbmBlack = NULL, hbmWhite = NULL, hbmOut = NULL;
+    DWORD *Black, *White, *Out;
+    RECT rc = { 0, 0, lw, lh };
+    BLENDFUNCTION Blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    HGDIOBJ old;
+    BOOL ok = FALSE;
+
+    if (w <= 0 || h <= 0 || lw <= 0 || lh <= 0)
+        return FALSE;
+    hdcMem = CreateCompatibleDC(hDC);
+    if (!hdcMem)
+        return FALSE;
+
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = lw;
+    bmi.bmiHeader.biHeight = -lh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    hbmBlack = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, (void **)&Black, NULL, 0);
+    hbmWhite = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, (void **)&White, NULL, 0);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    hbmOut = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, (void **)&Out, NULL, 0);
+    if (!hbmBlack || !hbmWhite || !hbmOut)
+        goto done;
+
+    for (i = 0; i < lw * lh; i++)
+    {
+        Black[i] = 0x00000000;
+        White[i] = 0x00FFFFFF;
+    }
+    old = SelectObject(hdcMem, hbmBlack);
+    DrawThemeBackground(hTheme, hdcMem, iPartId, iStateId, &rc, NULL);
+    SelectObject(hdcMem, hbmWhite);
+    DrawThemeBackground(hTheme, hdcMem, iPartId, iStateId, &rc, NULL);
+    SelectObject(hdcMem, old);
+    GdiFlush();
+
+    /* On black the result is the premultiplied colour; white - black = 255 - alpha. */
+    for (i = 0; i < lw * lh; i++)
+    {
+        INT a = 255 - (INT)(((White[i] >> 8) & 0xFF) - ((Black[i] >> 8) & 0xFF));
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        Black[i] = (Black[i] & 0x00FFFFFF) | ((DWORD)a << 24);
+    }
+
+    for (y = 0; y < h; y++)
+    {
+        INT fy = ((2 * y + 1) * lh * 128) / h - 128, y0, y1, wy;
+        if (fy < 0) fy = 0;
+        y0 = fy >> 8; wy = fy & 0xFF;
+        y1 = y0 + 1 < lh ? y0 + 1 : lh - 1;
+        for (x = 0; x < w; x++)
+        {
+            INT fx = ((2 * x + 1) * lw * 128) / w - 128, x0, x1, wx, c;
+            DWORD p00, p01, p10, p11, v = 0;
+            if (fx < 0) fx = 0;
+            x0 = fx >> 8; wx = fx & 0xFF;
+            if (x0 >= lw) x0 = lw - 1;
+            x1 = x0 + 1 < lw ? x0 + 1 : lw - 1;
+            p00 = Black[y0 * lw + x0]; p01 = Black[y0 * lw + x1];
+            p10 = Black[y1 * lw + x0]; p11 = Black[y1 * lw + x1];
+            for (c = 0; c < 32; c += 8)
+            {
+                INT top = (((p00 >> c) & 0xFF) * (256 - wx) + ((p01 >> c) & 0xFF) * wx) >> 8;
+                INT bot = (((p10 >> c) & 0xFF) * (256 - wx) + ((p11 >> c) & 0xFF) * wx) >> 8;
+                v |= (DWORD)(((top * (256 - wy) + bot * wy) >> 8) & 0xFF) << c;
+            }
+            Out[y * w + x] = v;
+        }
+    }
+
+    old = SelectObject(hdcMem, hbmOut);
+    ok = GdiAlphaBlend(hDC, prc->left, prc->top, w, h, hdcMem, 0, 0, w, h, Blend);
+    SelectObject(hdcMem, old);
+
+done:
+    if (hbmBlack) DeleteObject(hbmBlack);
+    if (hbmWhite) DeleteObject(hbmWhite);
+    if (hbmOut) DeleteObject(hbmOut);
+    DeleteDC(hdcMem);
+    return ok;
+}
+
 static VOID
-ThemeDrawCaptionGroupStart(PDRAW_CONTEXT pcontext, INT iPartId, INT iStateId, const RECT *prc)
+ThemeDrawCaptionPart(PDRAW_CONTEXT pcontext, HDC hDC, INT iPartId, INT iStateId, const RECT *prc, BOOL Scaled)
+{
+    if (!Scaled ||
+        !ThemeDrawScaledCaptionPart(pcontext->theme, hDC, iPartId, iStateId, prc, ThemeCaptionDpi(pcontext)))
+    {
+        DrawThemeBackground(pcontext->theme, hDC, iPartId, iStateId, prc, NULL);
+    }
+}
+
+static VOID
+ThemeDrawCaptionGroupStart(PDRAW_CONTEXT pcontext, INT iPartId, INT iStateId, const RECT *prc, BOOL Scaled)
 {
     INT cx = prc->right - prc->left, cy = prc->bottom - prc->top, edge, i;
     RECT rc = { 0, 0, cx, cy };
@@ -1016,8 +1152,8 @@ ThemeDrawCaptionGroupStart(PDRAW_CONTEXT pcontext, INT iPartId, INT iStateId, co
     old = SelectObject(hdcMem, hbmp);
     for (i = 0; i < cx; i++)
         BitBlt(hdcMem, cx - 1 - i, 0, 1, cy, pcontext->hDC, prc->left + i, prc->top, SRCCOPY);
-    DrawThemeBackground(pcontext->theme, pcontext->hDC, iPartId, iStateId, prc, NULL);
-    DrawThemeBackground(pcontext->theme, hdcMem, iPartId, iStateId, &rc, NULL);
+    ThemeDrawCaptionPart(pcontext, pcontext->hDC, iPartId, iStateId, prc, Scaled);
+    ThemeDrawCaptionPart(pcontext, hdcMem, iPartId, iStateId, &rc, Scaled);
     for (i = 0; i < edge; i++)
         BitBlt(pcontext->hDC, prc->left + i, prc->top, 1, cy, hdcMem, cx - 1 - i, 0, SRCCOPY);
     SelectObject(hdcMem, old);
@@ -1026,7 +1162,7 @@ ThemeDrawCaptionGroupStart(PDRAW_CONTEXT pcontext, INT iPartId, INT iStateId, co
     return;
 
 plain:
-    DrawThemeBackground(pcontext->theme, pcontext->hDC, iPartId, iStateId, prc, NULL);
+    ThemeDrawCaptionPart(pcontext, pcontext->hDC, iPartId, iStateId, prc, Scaled);
 }
 
 static void
@@ -1104,15 +1240,22 @@ ThemeDrawCaptionButton(PDRAW_CONTEXT pcontext,
         ThemeDrawCaptionGlyphButton(pcontext, buttonId, iStateId,
                                     &pwndData->rcCaptionButtons[buttonId],
                                     ThemeDarkCaptionColor(pcontext), TRUE, ThemeCaptionDpi(pcontext));
-    else if (ThemeUseCaptionGlyphs(pcontext->theme, iPartId, iStateId, &background))
-        ThemeDrawCaptionGlyphButton(pcontext, buttonId, iStateId,
-                                    &pwndData->rcCaptionButtons[buttonId], background, FALSE,
-                                    ThemeCaptionDpi(pcontext));
-    else if (iPartId == WP_CLOSEBUTTON && !(pcontext->wi.dwStyle & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX)))
-        ThemeDrawCaptionGroupStart(pcontext, iPartId, iStateId, &pwndData->rcCaptionButtons[buttonId]);
     else
-        DrawThemeBackground(pcontext->theme, pcontext->hDC, iPartId, iStateId,
-                            &pwndData->rcCaptionButtons[buttonId], NULL);
+    {
+        /* No high-DPI button images: flat glyphs, or (opt-in) the 96-DPI images scaled up. */
+        BOOL HiDpiFallback = ThemeUseCaptionGlyphs(pcontext->theme, iPartId, iStateId, &background);
+
+        if (HiDpiFallback && ThemeCaptionGlyphsEnabled())
+            ThemeDrawCaptionGlyphButton(pcontext, buttonId, iStateId,
+                                        &pwndData->rcCaptionButtons[buttonId], background, FALSE,
+                                        ThemeCaptionDpi(pcontext));
+        else if (iPartId == WP_CLOSEBUTTON && !(pcontext->wi.dwStyle & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX)))
+            ThemeDrawCaptionGroupStart(pcontext, iPartId, iStateId, &pwndData->rcCaptionButtons[buttonId],
+                                       HiDpiFallback);
+        else
+            ThemeDrawCaptionPart(pcontext, pcontext->hDC, iPartId, iStateId,
+                                 &pwndData->rcCaptionButtons[buttonId], HiDpiFallback);
+    }
 }
 
 static DWORD
@@ -1262,6 +1405,7 @@ ThemeDwmDrawCaptionButton(HDC hDC, const RECT *prc, UINT Button, ULONG State, BO
     HTHEME hTheme;
     INT iPart, iState;
     COLORREF Background;
+    BOOL HiDpiFallback;
     DPI_AWARENESS_CONTEXT OldContext;
     UINT Dpi;
 
@@ -1315,7 +1459,11 @@ ThemeDwmDrawCaptionButton(HDC hDC, const RECT *prc, UINT Button, ULONG State, BO
 
     if (!hTheme)
         return FALSE;
-    if (ThemeUseCaptionGlyphs(hTheme, iPart, iState, &Background))
+    HiDpiFallback = ThemeUseCaptionGlyphs(hTheme, iPart, iState, &Background);
+    ZeroMemory(&context, sizeof(context));
+    context.hDC = hDC;
+    context.theme = hTheme;
+    if (HiDpiFallback && ThemeCaptionGlyphsEnabled())
     {
         ZeroMemory(&context, sizeof(context));
         context.hDC = hDC;
@@ -1332,11 +1480,11 @@ ThemeDwmDrawCaptionButton(HDC hDC, const RECT *prc, UINT Button, ULONG State, BO
         ZeroMemory(&context, sizeof(context));
         context.hDC = hDC;
         context.theme = hTheme;
-        ThemeDrawCaptionGroupStart(&context, iPart, iState, prc);
+        ThemeDrawCaptionGroupStart(&context, iPart, iState, prc, HiDpiFallback);
     }
     else
     {
-        DrawThemeBackground(hTheme, hDC, iPart, iState, prc, NULL);
+        ThemeDrawCaptionPart(&context, hDC, iPart, iState, prc, HiDpiFallback);
     }
     CloseThemeData(hTheme);
     return TRUE;
