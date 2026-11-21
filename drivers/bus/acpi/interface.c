@@ -1257,7 +1257,13 @@ Bus_PDO_QueryInterface(PPDO_DEVICE_DATA DeviceData,
 #endif
   else
   {
-      DPRINT1("Invalid GUID\n");
+      const GUID *Guid = IrpSp->Parameters.QueryInterface.InterfaceType;
+
+      DPRINT1("Unsupported ACPI interface %08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x (version %u, size %u)\n",
+              Guid->Data1, Guid->Data2, Guid->Data3, Guid->Data4[0], Guid->Data4[1],
+              Guid->Data4[2], Guid->Data4[3], Guid->Data4[4], Guid->Data4[5],
+              Guid->Data4[6], Guid->Data4[7], IrpSp->Parameters.QueryInterface.Version,
+              IrpSp->Parameters.QueryInterface.Size);
       return STATUS_NOT_SUPPORTED;
   }
 }
