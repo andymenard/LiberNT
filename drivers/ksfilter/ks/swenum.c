@@ -235,6 +235,9 @@ KspEnumerateBusRegistryKeys(
         /* check for success */
         if (NT_SUCCESS(Status))
         {
+            /* ZwEnumerateKey returns a counted name without a terminator. */
+            KeyInfo->Name[KeyInfo->NameLength / sizeof(WCHAR)] = UNICODE_NULL;
+
             /* perform callback */
             Status = Callback(hNewKey, BusDeviceExtension, DeviceEntry, KeyInfo->Name, ReferenceString);
 
