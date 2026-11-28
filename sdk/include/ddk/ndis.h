@@ -10987,6 +10987,20 @@ typedef struct _NDIS_MINIPORT_ADAPTER_HARDWARE_ASSIST_ATTRIBUTES
 
 #define NDIS_INTERMEDIATE_DRIVER                0x00000001
 
+#define NDIS_SG_LIST_WRITE_TO_DEVICE 0x00000001
+
+_IRQL_requires_(DISPATCH_LEVEL)
+NDIS_STATUS
+NDISAPI
+NTAPI
+NdisMAllocateNetBufferSGList(
+    _In_ NDIS_HANDLE NdisMiniportDmaHandle,
+    _In_ PNET_BUFFER NetBuffer,
+    _In_ PVOID Context,
+    _In_ ULONG Flags,
+    _In_opt_ PVOID ScatterGatherListBuffer,
+    _In_ ULONG ScatterGatherListBufferSize);
+
 _IRQL_requires_(DISPATCH_LEVEL)
 VOID
 NDISAPI
