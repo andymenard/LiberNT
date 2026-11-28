@@ -119,8 +119,14 @@ BaseGetNamedObjectDirectory(
     {
         HANDLE NewDirectory;
 
-        swprintf(Buffer, ARRAY_SIZE(Buffer), L"\\Sessions\\%u\\BaseNamedObjects", NtCurrentTeb()->Peb->SessionId);
-        RtlInitUnicodeString(&Name, Buffer);
+        ULONG SessionId = NtCurrentTeb()->Peb->SessionId;
+        if (SessionId)
+        {
+            swprintf(Buffer, ARRAY_SIZE(Buffer), L"\\Sessions\\%u\\BaseNamedObjects", SessionId);
+            RtlInitUnicodeString(&Name, Buffer);
+        }
+        else
+            RtlInitUnicodeString(&Name, L"\\BaseNamedObjects");
         InitializeObjectAttributes(&ObjectAttributes, &Name, 0, 0, NULL);
         Status = NtOpenDirectoryObject(&NewDirectory, DIRECTORY_CREATE_OBJECT | DIRECTORY_TRAVERSE, &ObjectAttributes);
         if (!Status && InterlockedCompareExchangePointer(&BaseDirectory, NewDirectory, 0) != 0) CloseHandle(NewDirectory);
@@ -129,7 +135,7 @@ BaseGetNamedObjectDirectory(
     return Status;
 }
 
-static void
+static NTSTATUS
 GetCreateObjectAttributes(
     _Out_ OBJECT_ATTRIBUTES *ObjectAttributes,
     _Out_ UNICODE_STRING *ObjectName,
@@ -146,8 +152,9 @@ GetCreateObjectAttributes(
     {
         RtlInitUnicodeString(ObjectName, Name);
         ObjectAttributes->ObjectName = ObjectName;
-        BaseGetNamedObjectDirectory(&ObjectAttributes->RootDirectory);
+        return BaseGetNamedObjectDirectory(&ObjectAttributes->RootDirectory);
     }
+    return STATUS_SUCCESS;
 }
 
 HANDLE
@@ -184,7 +191,7 @@ CreateEventExW(
 
     __TRY
     {
-        GetCreateObjectAttributes(&ObjectAttributes, &ObjectName, SecurityAttributes, Name);
+        Status = GetCreateObjectAttributes(&ObjectAttributes, &ObjectName, SecurityAttributes, Name);
     }
     __EXCEPT_PAGE_FAULT
     {
@@ -192,6 +199,11 @@ CreateEventExW(
         return NULL;
     }
     __ENDTRY
+    if (!NT_SUCCESS(Status))
+    {
+        SetLastError(RtlNtStatusToDosError(Status));
+        return NULL;
+    }
 
     Status = NtCreateEvent(&Event, DesiredAccess, &ObjectAttributes, (Flags & CREATE_EVENT_MANUAL_RESET) ? NotificationEvent : SynchronizationEvent, (Flags & CREATE_EVENT_INITIAL_SET) != 0);
     if (Status == STATUS_OBJECT_NAME_EXISTS) SetLastError(ERROR_ALREADY_EXISTS);
@@ -234,7 +246,12 @@ CreateMutexExW(
     OBJECT_ATTRIBUTES ObjectAttributes;
     NTSTATUS Status;
 
-    GetCreateObjectAttributes(&ObjectAttributes, &ObjectName, SecurityAttributes, Name);
+    Status = GetCreateObjectAttributes(&ObjectAttributes, &ObjectName, SecurityAttributes, Name);
+    if (!NT_SUCCESS(Status))
+    {
+        SetLastError(RtlNtStatusToDosError(Status));
+        return NULL;
+    }
     Status = NtCreateMutant(&Mutex, DesiredAccess, &ObjectAttributes, (Flags & CREATE_MUTEX_INITIAL_OWNER) != 0);
     if (Status == STATUS_OBJECT_NAME_EXISTS) SetLastError(ERROR_ALREADY_EXISTS);
     else SetLastError(RtlNtStatusToDosError(Status));
