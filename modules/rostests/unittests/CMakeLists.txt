@@ -10,3 +10,5 @@ add_subdirectory(pathcch)
 add_subdirectory(setuplib)
 add_subdirectory(terminal)
 add_subdirectory(usbaudio)
+
+add_subdirectory(nwifi)
