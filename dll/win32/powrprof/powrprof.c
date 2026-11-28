@@ -66,6 +66,7 @@ static const GUID PowrProfDiskSubgroup = { 0x0012EE47, 0x9041, 0x4B5D, { 0x9B, 0
 static const GUID PowrProfDiskPowerdownTimeout = { 0x6738E2C4, 0xE8A5, 0x4A42, { 0xB1, 0x6A, 0xE0, 0x40, 0xE7, 0x69, 0x75, 0x6E } };
 static const GUID PowrProfButtonSubgroup = { 0x4F971E89, 0xEEBD, 0x4455, { 0xA8, 0xDE, 0x9E, 0x59, 0x04, 0x0E, 0x73, 0x47 } };
 static const GUID PowrProfPowerButtonAction = { 0x7648EFA3, 0xDD9C, 0x4E3E, { 0xB5, 0x66, 0x50, 0xF9, 0x29, 0x38, 0x62, 0x80 } };
+static const GUID PowrProfLidCloseAction = { 0x5CA83367, 0x6E45, 0x459F, { 0xA2, 0x7B, 0x47, 0x6B, 0x1D, 0x01, 0xC9, 0x36 } };
 static const POWER_ACTION PowrProfButtonActions[] = { PowerActionNone, PowerActionSleep, PowerActionHibernate, PowerActionShutdownOff };
 
 typedef struct _POWRPROF_SCHEME_DEFAULTS
@@ -375,9 +376,12 @@ POWRPROF_GetBuiltinSettingDefaults(
     }
     if (IsEqualGUID(Subgroup, &PowrProfButtonSubgroup))
     {
-        if (!IsEqualGUID(Setting, &PowrProfPowerButtonAction))
+        if (IsEqualGUID(Setting, &PowrProfPowerButtonAction))
+            *Value = 3;
+        else if (IsEqualGUID(Setting, &PowrProfLidCloseAction))
+            *Value = 0;
+        else
             return ERROR_FILE_NOT_FOUND;
-        *Value = 3;
         return ERROR_SUCCESS;
     }
     if (!IsEqualGUID(Subgroup, &GUID_PROCESSOR_SETTINGS_SUBGROUP))
@@ -690,16 +694,22 @@ POWRPROF_ApplyScheme(
         Error = POWRPROF_ApplyProcessorPolicyValues(Scheme, PowerCondition, &Values[PowerCondition]);
     for (PowerCondition = PoAc; PowerCondition <= PoDc && Error == ERROR_SUCCESS; PowerCondition++)
     {
-        POWER_ACTION_POLICY ButtonPolicy = { 0 };
-        DWORD ButtonIndex;
+        const GUID *ButtonSettings[] = { &PowrProfPowerButtonAction, &PowrProfLidCloseAction };
+        unsigned int Index;
 
-        Error = POWRPROF_ReadValueIndex(Scheme, &PowrProfButtonSubgroup, &PowrProfPowerButtonAction,
-                                        PowerCondition == PoAc, &ButtonIndex);
-        if (Error == ERROR_SUCCESS && ButtonIndex < _countof(PowrProfButtonActions))
+        for (Index = 0; Index < _countof(ButtonSettings) && Error == ERROR_SUCCESS; Index++)
         {
-            ButtonPolicy.Action = PowrProfButtonActions[ButtonIndex];
-            Error = POWRPROF_ApplySettingValue(&PowrProfPowerButtonAction, PowerCondition, &ButtonPolicy,
-                                               sizeof(ButtonPolicy));
+            POWER_ACTION_POLICY ButtonPolicy = { 0 };
+            DWORD ButtonIndex;
+
+            Error = POWRPROF_ReadValueIndex(Scheme, &PowrProfButtonSubgroup, ButtonSettings[Index],
+                                            PowerCondition == PoAc, &ButtonIndex);
+            if (Error == ERROR_SUCCESS && ButtonIndex < _countof(PowrProfButtonActions))
+            {
+                ButtonPolicy.Action = PowrProfButtonActions[ButtonIndex];
+                Error = POWRPROF_ApplySettingValue(ButtonSettings[Index], PowerCondition, &ButtonPolicy,
+                                                   sizeof(ButtonPolicy));
+            }
         }
     }
     for (PowerCondition = PoAc; PowerCondition <= PoDc && Error == ERROR_SUCCESS; PowerCondition++)

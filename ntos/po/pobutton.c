@@ -85,7 +85,8 @@ static
 VOID
 PopTakeButtonAction(
     _In_ LPCGUID Setting,
-    _In_ POWER_ACTION Default)
+    _In_ POWER_ACTION Default,
+    _In_ BOOLEAN LidClosed)
 {
     POWER_ACTION_POLICY Policy;
     POWER_ACTION Action = Default;
@@ -103,7 +104,10 @@ PopTakeButtonAction(
         case PowerActionSleep:
             if (PopAoAc)
             {
-                PopToggleDisplay();
+                if (LidClosed)
+                    PopRequestDisplayState(PowerMonitorOff);
+                else
+                    PopToggleDisplay();
                 break;
             }
             Status = ZwInitiatePowerAction(PowerActionSleep, PowerSystemSleeping1, 0, TRUE);
@@ -166,8 +170,13 @@ PopHandleButtonEvent(
         PopPublishLidState((Event & SYS_BUTTON_LID_OPEN) ? 1 : 0);
 
         /* TODO: Windows 11's lid-close action without a GUID_LIDCLOSE_ACTION value is not sourced; nothing is done then */
-        if ((Event & SYS_BUTTON_LID_CLOSED) && !(Event & SYS_BUTTON_LID_INITIAL) && !(Event & SYS_BUTTON_WAKE))
-            PopTakeButtonAction(&GUID_LIDCLOSE_ACTION, PowerActionNone);
+        if (!(Event & SYS_BUTTON_LID_INITIAL))
+        {
+            if ((Event & SYS_BUTTON_LID_CLOSED) && !(Event & SYS_BUTTON_WAKE))
+                PopTakeButtonAction(&GUID_LIDCLOSE_ACTION, PowerActionNone, TRUE);
+            else if ((Event & SYS_BUTTON_LID_OPEN) && PopAoAc)
+                PopRequestDisplayState(PowerMonitorOn);
+        }
     }
 
     /* A press that woke the machine has done its work */
@@ -175,11 +184,11 @@ PopHandleButtonEvent(
         return;
 
     if (Event & SYS_BUTTON_POWER)
-        PopTakeButtonAction(&GUID_POWERBUTTON_ACTION, PowerActionShutdownOff);
+        PopTakeButtonAction(&GUID_POWERBUTTON_ACTION, PowerActionShutdownOff, FALSE);
 
     /* TODO: Windows 11's sleep button action without a GUID_SLEEPBUTTON_ACTION value is not sourced; nothing is done then */
     if (Event & SYS_BUTTON_SLEEP)
-        PopTakeButtonAction(&GUID_SLEEPBUTTON_ACTION, PowerActionNone);
+        PopTakeButtonAction(&GUID_SLEEPBUTTON_ACTION, PowerActionNone, FALSE);
 }
 
 static
