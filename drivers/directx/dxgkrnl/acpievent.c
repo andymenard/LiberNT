@@ -75,6 +75,7 @@ DxgkpDeliverAcpiEvent(
     PDXGKDDI_NOTIFY_ACPI_EVENT Notify;
     NTSTATUS Status;
     ULONG    Flags = 0;
+    BOOLEAN  LidEvent;
 
     PAGED_CODE();
 
@@ -97,6 +98,11 @@ DxgkpDeliverAcpiEvent(
                       Adapter, Record->Type, Record->Event);
         return;
     }
+    LidEvent = Record->Type == DxgkPowerStateEvent &&
+               Record->Event == PO_CB_LID_SWITCH_STATE && Record->HasArgument;
+    if (LidEvent && Record->Argument == 0)
+        InterlockedExchange(&Adapter->AcpiEvents.LidClosedForTopology, TRUE);
+
     _SEH2_TRY
     {
         Status = Notify(Adapter->MiniportDeviceContext,
@@ -110,6 +116,8 @@ DxgkpDeliverAcpiEvent(
         Status = _SEH2_GetExceptionCode();
     }
     _SEH2_END;
+    if (LidEvent && Record->Argument != 0)
+        InterlockedExchange(&Adapter->AcpiEvents.LidClosedForTopology, FALSE);
     DxgkReleaseKmdCall(Adapter);
 
     DXGKRNL_INFO("DISPLAY_EVENT: adapter %p type=%d code=0x%lx argument=%lu present=%u -> 0x%08lx flags=0x%lx\n",
@@ -120,7 +128,11 @@ DxgkpDeliverAcpiEvent(
     if (!NT_SUCCESS(Status))
         return;
 
-    if (Flags & DXGK_ACPI_POLL_DISPLAY_CHILDREN)
+    /* A closed lid can remove the internal panel from the active topology.
+     * Check for its return after the miniport receives the lid-open event,
+     * even when it does not request a poll. */
+    if ((Flags & DXGK_ACPI_POLL_DISPLAY_CHILDREN) ||
+        (LidEvent && Record->Argument != 0))
     {
         Status = DxgkPnpQueuePollDisplayChildren(Adapter);
         if (!NT_SUCCESS(Status))

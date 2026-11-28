@@ -639,7 +639,8 @@ typedef struct _DXGKP_ACPI_EVENTS
     PVOID                       AcPowerSettingHandle;
     PVOID                       LidPowerSettingHandle;
     PVOID                       HwProfileNotificationEntry; /* dock/undock */
-    volatile LONG               LastLidState;   /* -1 none delivered yet */
+    volatile LONG               LastLidState;   /* -1 none queued yet */
+    volatile LONG               LidClosedForTopology;
     ACPI_INTERFACE_STANDARD2    AcpiInterface;  /* valid while registered */
 } DXGKP_ACPI_EVENTS, *PDXGKP_ACPI_EVENTS;
 

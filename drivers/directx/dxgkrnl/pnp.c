@@ -190,6 +190,10 @@ DxgkpSnapshotChildrenForPoll(
 }
 
 static BOOLEAN
+DxgkpIsInternalVideoOutput(
+    _In_ D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY Technology);
+
+static BOOLEAN
 DxgkpPublishChildConnection(
     _In_ PDXGKRNL_ADAPTER Adapter,
     _In_ ULONG ChildUid,
@@ -216,6 +220,14 @@ DxgkpPublishChildConnection(
         if (Child->Descriptor.ChildUid != ChildUid || Child->Descriptor.ChildDeviceType != TypeVideoOutput || (ValidateHpdAwareness && Child->Descriptor.ChildCapabilities.HpdAwareness != ExpectedHpdAwareness))
             continue;
         ChildFound = TRUE;
+        /* The powered-off internal panel can report a disconnect until the
+         * miniport processes lid-open. Keep its desktop topology intact. */
+        if (!NewConnected &&
+            InterlockedCompareExchange(&Adapter->AcpiEvents.LidClosedForTopology, 0, 0) &&
+            DxgkpIsInternalVideoOutput(Child->Descriptor.ChildCapabilities.Type.VideoOutput.InterfaceTechnology))
+        {
+            break;
+        }
         if (Child->Connected != NewConnected)
         {
             Child->Connected = NewConnected;
