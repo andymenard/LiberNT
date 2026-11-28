@@ -69,11 +69,9 @@ typedef struct _CLASS_DEVICE_EXTENSION
 	LIST_ENTRY ListHead;
 	KSPIN_LOCK ListSpinLock;
 	KSPIN_LOCK SpinLock;
-	PIRP PendingIrp;
+	LIST_ENTRY PendingReads;
+	BOOLEAN ReadsStopped;
 	SIZE_T InputCount;
-	ULONG TraceCallbacks;
-	ULONG TraceReads;
-	ULONG TraceCompletions;
 	PMOUSE_INPUT_DATA PortData;
 	LPCWSTR DeviceName;
 } CLASS_DEVICE_EXTENSION, *PCLASS_DEVICE_EXTENSION;
