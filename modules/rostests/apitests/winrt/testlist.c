@@ -4,6 +4,7 @@
 extern void func_AppInstallManager(void);
 extern void func_DispatcherQueue(void);
 extern void func_NotificationData(void);
+extern void func_PackageManager(void);
 extern void func_PenDevice(void);
 extern void func_ToastCallback(void);
 extern void func_ToastHistory(void);
@@ -16,6 +17,7 @@ const struct test winetest_testlist[] =
     { "AppInstallManager", func_AppInstallManager },
     { "DispatcherQueue", func_DispatcherQueue },
     { "NotificationData", func_NotificationData },
+    { "PackageManager", func_PackageManager },
     { "PenDevice", func_PenDevice },
     { "ToastCallback", func_ToastCallback },
     { "ToastHistory", func_ToastHistory },

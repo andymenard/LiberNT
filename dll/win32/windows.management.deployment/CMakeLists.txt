@@ -1,0 +1,9 @@
+spec2def(windows.management.deployment.dll windows.management.deployment.spec)
+
+add_library(windows_management_deployment MODULE package_manager.c ${CMAKE_CURRENT_BINARY_DIR}/windows.management.deployment.def)
+set_target_properties(windows_management_deployment PROPERTIES OUTPUT_NAME "windows.management.deployment")
+set_module_type(windows_management_deployment win32dll)
+add_importlibs(windows_management_deployment combase kernel32 msvcrt ntdll)
+target_link_libraries(windows_management_deployment uuid)
+add_dependencies(windows_management_deployment psdk)
+add_cd_file(TARGET windows_management_deployment DESTINATION reactos/system32 FOR all)

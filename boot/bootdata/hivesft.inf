@@ -3,6 +3,8 @@ Signature = "$Windows NT$"
 
 [AddReg]
 
+HKLM,"SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Management.Deployment.PackageManager","DllPath",0x00020000,"%SystemRoot%\System32\windows.management.deployment.dll"
+
 
 ; Applications
 HKLM,"SOFTWARE\Classes\Applications\notepad.exe\shell\open\command","",0x00020000,"%SystemRoot%\system32\notepad.exe ""%1"""

@@ -1,0 +1,7 @@
+@ stdcall DismInitialize(long wstr wstr)
+@ stdcall DismShutdown()
+@ stdcall DismOpenSession(wstr wstr wstr ptr)
+@ stdcall DismCloseSession(long)
+@ stdcall DismDelete(ptr)
+@ stdcall _DismGetProvisionedAppxPackages(long ptr ptr)
+@ stdcall _DismRemoveProvisionedAppxPackage(long wstr)

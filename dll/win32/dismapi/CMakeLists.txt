@@ -1,0 +1,5 @@
+spec2def(dismapi.dll dismapi.spec)
+add_library(dismapi MODULE session.c provisioning.c ${CMAKE_CURRENT_BINARY_DIR}/dismapi.def)
+set_module_type(dismapi win32dll)
+add_importlibs(dismapi msvcrt kernel32 advapi32 ntdll)
+add_cd_file(TARGET dismapi DESTINATION reactos/system32 FOR all)

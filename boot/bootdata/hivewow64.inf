@@ -8,6 +8,8 @@ Signature = "$Windows NT$"
 
 [AddReg]
 
+HKLM,"SOFTWARE\Wow6432Node\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Management.Deployment.PackageManager","DllPath",0x00020000,"%SystemRoot%\SysWOW64\windows.management.deployment.dll"
+
 HKLM,"SOFTWARE\Wow6432Node\Microsoft\Cryptography\OID\EncodingType 0\CryptSIPDllGetCaps\{9BA61D3F-E73A-11D0-8CD2-00C04FC295EE}","Dll",0x00000000,"WINTRUST.DLL"
 HKLM,"SOFTWARE\Wow6432Node\Microsoft\Cryptography\OID\EncodingType 0\CryptSIPDllGetCaps\{9BA61D3F-E73A-11D0-8CD2-00C04FC295EE}","FuncName",0x00000000,"CryptSIPGetCaps"
 HKLM,"SOFTWARE\Wow6432Node\Microsoft\Cryptography\OID\EncodingType 0\CryptSIPDllGetCaps\{C689AAB8-8E78-11D0-8C47-00C04FC295EE}","Dll",0x00000000,"WINTRUST.DLL"
